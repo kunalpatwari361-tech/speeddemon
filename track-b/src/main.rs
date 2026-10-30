@@ -205,62 +205,84 @@ fn main() {
     let k = thread::available_parallelism().map_or(1, |x| x.get());
     let parts = cuts(docs, k);
 
-    // Pass 1: document frequency of every id, per thread.
-    let mut states: Vec<Vec<(u32, u32)>> = thread::scope(|s| {
-        let hs: Vec<_> = parts
-            .windows(2)
-            .map(|w| {
-                let (index, span) = (&index, &span);
-                s.spawn(move || {
-                    let mut state = vec![(0, 0); ids];
-                    index.scan(w[0], w[1], &mut state, span, |_, _, count| *count += 1);
-                    state
-                })
-            })
-            .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    // Runs f(part, state) on every part in parallel, each thread with its own state.
+    let each = |f: &(dyn Fn(usize, &mut [(u32, u32)]) -> Vec<u32> + Sync)| -> Vec<Vec<u32>> {
+        thread::scope(|s| {
+            let hs: Vec<_> = (0..parts.len() - 1).map(|j| s.spawn(move || f(j, &mut vec![(0, 0); ids]))).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        })
+    };
+
+    // A sample, the first sixteenth of every part, estimates which ids are common. Those get a
+    // bitset over all documents, which the full pass sets directly.
+    let sample = each(&|j, state| {
+        index.scan(parts[j], parts[j] + (parts[j + 1] - parts[j]) / 16, state, &span, |_, _, c| *c += 1);
+        state.iter().map(|s| s.1).collect()
+    });
+    let mut nbits = 0;
+    let bit_of: Vec<Option<usize>> = (0..ids)
+        .map(|id| (sample.iter().map(|s| s[id] as usize).sum::<usize>() * 16 * 32 >= n).then(|| (nbits, nbits += 1).0))
+        .collect();
+    let bits: Vec<AtomicU64> = (0..nbits * words).map(|_| AtomicU64::new(0)).collect();
+
+    // The full pass: a common id sets its bit; every other hit goes to the thread's stream as
+    // its id, after a marker (top bit set) naming the document.
+    let streams = each(&|j, state| {
+        let rare: usize = (0..ids).filter(|&id| bit_of[id].is_none()).map(|id| sample[j][id] as usize).sum();
+        let (mut stream, mut last) = (Vec::with_capacity(rare * 17 + n / k), u32::MAX);
+        index.scan(parts[j], parts[j + 1], state, &span, |doc, id, _| match bit_of[id] {
+            Some(b) => {
+                let w = &bits[b * words + doc as usize / 64];
+                w.store(w.load(Relaxed) | 1 << (doc % 64), Relaxed);
+            }
+            None => {
+                if doc != last {
+                    (last, _) = (doc, stream.push(1 << 31 | doc));
+                }
+                stream.push(id as u32);
+            }
+        });
+        stream
     });
 
-    // Common ids get a bitset; the rest a run of one flat id array, each thread writing its own
-    // part of it: its state becomes (0, where its part starts).
-    let df: Vec<usize> = (0..ids).map(|id| states.iter().map(|s| s[id].1 as usize).sum()).collect();
-    let (mut nbits, mut nflat) = (0, 0);
-    let place: Vec<(Option<usize>, usize)> = df
-        .iter()
-        .map(|&d| if d * 32 >= n { (Some(nbits), { nbits += 1; 0 }) } else { (None, { nflat += d; nflat - d }) })
-        .collect();
+    // The other ids get a run of one flat array: count each thread's hits per id, then each
+    // thread places its stream into its own part of every run.
+    let mut counts = each(&|j, _| {
+        let mut count = vec![0u32; ids];
+        streams[j].iter().filter(|&&v| v >> 31 == 0).for_each(|&v| count[v as usize] += 1);
+        count
+    });
+    let df: Vec<usize> = (0..ids).map(|id| counts.iter().map(|c| c[id] as usize).sum()).collect();
+    let mut nflat = 0;
+    let start: Vec<usize> = df.iter().map(|&d| (nflat, nflat += d).0).collect();
     for id in 0..ids {
-        let mut at = place[id].1 as u32;
-        for s in states.iter_mut() {
-            (s[id], at) = ((0, at), at + s[id].1);
+        let mut at = start[id] as u32;
+        for c in counts.iter_mut() {
+            (c[id], at) = (at, at + c[id]);
         }
     }
-    let bits: Vec<AtomicU64> = (0..nbits * words).map(|_| AtomicU64::new(0)).collect();
     let flat: Vec<AtomicU32> = (0..nflat).map(|_| AtomicU32::new(0)).collect();
-
-    // Pass 2: fill them.
     thread::scope(|s| {
-        for (w, mut state) in parts.windows(2).zip(states) {
-            let (index, span, place, bits, flat) = (&index, &span, &place, &bits, &flat);
+        for (stream, mut cur) in streams.into_iter().zip(counts) {
+            let flat = &flat;
             s.spawn(move || {
-                index.scan(w[0], w[1], &mut state, span, |doc, id, cur| match place[id].0 {
-                    Some(b) => {
-                        let w = &bits[b * words + doc as usize / 64];
-                        w.store(w.load(Relaxed) | 1 << (doc % 64), Relaxed);
+                let mut doc = 0;
+                for v in stream {
+                    if v >> 31 == 1 {
+                        doc = v & !(1 << 31);
+                    } else {
+                        flat[cur[v as usize] as usize].store(doc, Relaxed);
+                        cur[v as usize] += 1;
                     }
-                    None => {
-                        flat[*cur as usize].store(doc, Relaxed);
-                        *cur += 1;
-                    }
-                });
+                }
             });
         }
     });
     let bits: Vec<u64> = bits.into_iter().map(AtomicU64::into_inner).collect();
     let flat: Vec<u32> = flat.into_iter().map(AtomicU32::into_inner).collect();
-    let set = |id: usize| match place[id] {
-        (Some(b), _) => Set::Bits(&bits[b * words..][..words]),
-        (None, at) => Set::Ids(&flat[at..at + df[id]]),
+    let set = |id: usize| match bit_of[id] {
+        Some(b) => Set::Bits(&bits[b * words..][..words]),
+        None => Set::Ids(&flat[start[id]..start[id] + df[id]]),
     };
 
     // Answer the queries in k contiguous blocks, each into its own buffer.

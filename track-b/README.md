@@ -8,10 +8,11 @@ Rust, standard library only. Both files are memory-mapped; `/data` is already in
 
 Only what the queries ask about is indexed. The queries are parsed first. Every distinct term gets an id, and so does every adjacent pair of terms in a phrase. A token is represented by a 64-bit hash of its lowercased bytes, computed in the same loop that finds the token's end, and looked up in a small open-addressing table.
 
-The corpus is split into one part per hardware thread, each starting at a document whose id is a multiple of 64. Two passes run over it:
+The corpus is split into one part per hardware thread, each starting at a document whose id is a multiple of 64, and tokenized once:
 
-1. Count, per thread, how many documents contain each term and each phrase pair.
-2. Fill the postings. An id found in at least one document in 32 gets a bitset over all documents, which is smaller than a list at that density. The rest get a run of a single flat array of ascending document ids, and each thread writes its own part of every run. Thanks to the 64-document alignment, no two threads ever write the same bitset word, so the writes need no atomic read-modify-write.
+1. A sample, the first sixteenth of every part, estimates how many documents contain each id. An id expected in at least one document in 32 gets a bitset over all documents, which is smaller than a list at that density.
+2. The full pass sets common ids' bits directly. Thanks to the 64-document alignment, no two threads ever write the same bitset word, so the writes need no atomic read-modify-write. Every other hit is appended to the thread's stream as a 4-byte id, after a marker naming its document.
+3. Each thread counts its stream's hits per id. The counts give each thread its own part of every id's run in one flat array of ascending document ids, and each thread places its stream there.
 
 A `BOOL` query is evaluated left to right on a bitset result, combining it with each term's bitset or id list. A `PHRASE` of two terms is exactly the documents holding that adjacent pair. A longer phrase starts from the documents holding all of its pairs, which are very few, and checks each one's tokens for the whole sequence.
 
@@ -21,4 +22,4 @@ None.
 
 ## With another 24 hours
 
-A single pass that keeps each thread's hits, and faster tokenizing by scanning a word at a time.
+Smaller postings, with delta-coded lists, and faster tokenizing by scanning a word at a time.
