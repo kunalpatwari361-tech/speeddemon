@@ -120,26 +120,28 @@ fn main() {
     let mut cut: Vec<usize> = (0..k).map(|j| b.len() * j / k).map(|p| if p == 0 { 0 } else { next(p) }).collect();
     cut.push(b.len());
 
-    // Pass 1: requests per group, per thread; 5xx per group, shared.
+    // One parse: each thread counts its requests per group and keeps (group, latency) per line;
+    // 5xx per group are counted in one shared table, since they are rare.
     let errors: Vec<AtomicU32> = zeroed(SLOTS * HOURS);
-    let counts: Vec<Vec<u32>> = thread::scope(|s| {
+    let (counts, records): (Vec<Vec<u32>>, Vec<Vec<u64>>) = thread::scope(|s| {
         let hs: Vec<_> = cut
             .windows(2)
             .map(|w| {
                 let (ep, errors) = (&ep, &errors);
                 s.spawn(move || {
-                    let mut count = vec![0u32; SLOTS * HOURS];
-                    ep.each(w[0], w[1], base, |g, _, error| {
+                    let (mut count, mut records) = (vec![0u32; SLOTS * HOURS], Vec::with_capacity((w[1] - w[0]) / 64));
+                    ep.each(w[0], w[1], base, |g, l, error| {
                         count[g] += 1;
+                        records.push((g as u64) << 32 | l as u64);
                         if error {
                             errors[g].fetch_add(1, Relaxed);
                         }
                     });
-                    count
+                    (count, records)
                 })
             })
             .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
+        hs.into_iter().map(|h| h.join().unwrap()).unzip()
     });
 
     // Every group's latencies get one run of a flat array; each thread fills its own part of every run.
@@ -155,13 +157,14 @@ fn main() {
     }
     let lat = zeroed(at as usize);
     thread::scope(|s| {
-        for (w, mut cur) in cut.windows(2).zip(cursors) {
-            let (ep, lat) = (&ep, &lat);
+        for (mut cur, records) in cursors.into_iter().zip(records) {
+            let lat = &lat;
             s.spawn(move || {
-                ep.each(w[0], w[1], base, |g, l, _| {
-                    lat[cur[g] as usize].store(l, Relaxed);
+                for r in records {
+                    let g = (r >> 32) as usize;
+                    lat[cur[g] as usize].store(r as u32, Relaxed);
                     cur[g] += 1;
-                })
+                }
             });
         }
     });

@@ -10,10 +10,7 @@ The file is split into one part per hardware thread, at line boundaries. Each li
 
 Endpoints are interned into one lock-free open-addressing table shared by all threads. A slot holds where the endpoint first occurs in the file, so no string is ever copied. A group is (endpoint slot, hour), and the span is fixed at 72 hours.
 
-Two passes over the file avoid keeping a list per group:
-
-1. Each thread counts its requests per group. 5xx responses go to a shared counter, since they are rare.
-2. The counts become, for each thread, its own offset into every group's run of one flat latency array. Each thread then writes its latencies straight into place, with no merging afterwards.
+The file is parsed once. Each thread counts its requests per group and keeps a compact (group, latency) record per line; 5xx responses go to a shared counter, since they are rare. The counts become, for each thread, its own offset into every group's run of one flat latency array, and each thread then places its records straight into it, with no merging afterwards.
 
 Endpoints are sorted by byte. Hours are split across threads, and each formats its hours' lines in order, sorting each group's run once to read the nearest-rank percentiles. The buffers are written in order.
 
