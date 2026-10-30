@@ -173,63 +173,47 @@ impl Index<'_> {
 }
 
 /// A posting set: a bitset over all documents when common, else ascending ids.
+#[derive(Clone, Copy)]
 enum Set<'a> {
     Bits(&'a [u64]),
     Ids(&'a [u32]),
 }
 
-/// Applies one operator to the running result r, a bitset: '=' load, 'A' and, 'O' or, 'N' and-not.
-fn apply(r: &mut [u64], op: u8, s: Set, keep: &mut Vec<u32>) {
-    let bit = |d: u32| (d as usize / 64, 1u64 << (d % 64));
-    match (op, s) {
-        (b'=', Set::Bits(b)) => r.copy_from_slice(b),
-        (b'A', Set::Bits(b)) => r.iter_mut().zip(b).for_each(|(x, y)| *x &= y),
-        (b'O', Set::Bits(b)) => r.iter_mut().zip(b).for_each(|(x, y)| *x |= y),
-        (b'N', Set::Bits(b)) => r.iter_mut().zip(b).for_each(|(x, y)| *x &= !y),
-        (b'O', Set::Ids(a)) => a.iter().for_each(|&d| r[bit(d).0] |= bit(d).1),
-        (b'N', Set::Ids(a)) => a.iter().for_each(|&d| r[bit(d).0] &= !bit(d).1),
-        (op, Set::Ids(a)) => {
-            keep.clear();
-            keep.extend(a.iter().filter(|&&d| op == b'=' || r[bit(d).0] & bit(d).1 != 0));
-            r.fill(0);
-            keep.iter().for_each(|&d| r[bit(d).0] |= bit(d).1);
-        }
-        _ => unreachable!(),
-    }
+fn has(bits: &[u64], d: u32) -> bool {
+    bits[d as usize / 64] >> (d % 64) & 1 == 1
 }
 
-/// Evaluates (operator, set) steps left to right into v, as ascending ids. The result stays a
-/// list while it can, and moves to the bitset r only to load or OR in a common term.
-fn eval<'a>(steps: impl Iterator<Item = (u8, Set<'a>)>, r: &mut [u64], v: &mut Vec<u32>, tmp: &mut Vec<u32>) {
+/// Evaluates (operator, set) steps left to right into v, as ascending ids: '=' load, 'A' and,
+/// 'O' or, 'N' and-not. The result is held as the bitset r instead only while loading or ORing
+/// in a common term has made it large; an AND with ids makes it a list again.
+fn eval<'a>(steps: impl Iterator<Item = (u8, Set<'a>)>, r: &mut [u64], v: &mut Vec<u32>) {
     let mut dense = false;
     for (op, s) in steps {
-        if !dense {
-            match (op, &s) {
-                (b'=', Set::Ids(a)) => (v.clear(), v.extend_from_slice(a)).0,
-                (b'A' | b'N', Set::Bits(b)) => v.retain(|&d| (b[d as usize / 64] >> (d % 64) & 1 == 1) == (op == b'A')),
-                (b'A' | b'N', Set::Ids(a)) => {
-                    let mut i = 0;
-                    v.retain(|&d| {
-                        while i < a.len() && a[i] < d {
-                            i += 1;
-                        }
-                        (i < a.len() && a[i] == d) == (op == b'A')
-                    });
-                }
-                (b'O', Set::Ids(a)) => {
-                    v.extend_from_slice(a);
-                    v.sort_unstable();
-                    v.dedup();
-                }
-                _ => {
-                    r.fill(0);
-                    v.iter().for_each(|&d| r[d as usize / 64] |= 1 << (d % 64));
-                    dense = true;
-                }
+        match (op, s, dense) {
+            (b'=', Set::Ids(a), _) => (v.clear(), v.extend_from_slice(a), dense = false).0,
+            (b'=', Set::Bits(b), _) => (r.copy_from_slice(b), dense = true).0,
+            (_, Set::Bits(b), false) if op != b'O' => v.retain(|&d| has(b, d) == (op == b'A')),
+            (_, Set::Ids(a), false) if op != b'O' => {
+                let mut i = 0;
+                v.retain(|&d| {
+                    i += a[i..].iter().take_while(|&&x| x < d).count();
+                    (a.get(i) == Some(&d)) == (op == b'A')
+                });
             }
-        }
-        if dense {
-            apply(r, op, s, tmp);
+            (_, Set::Ids(a), false) => (v.extend_from_slice(a), v.sort_unstable(), v.dedup()).0,
+            (_, Set::Bits(b), false) => {
+                r.copy_from_slice(b);
+                v.iter().for_each(|&d| r[d as usize / 64] |= 1 << (d % 64));
+                dense = true;
+            }
+            (b'A', Set::Ids(a), true) => (v.clear(), v.extend(a.iter().filter(|&&d| has(r, d))), dense = false).0,
+            (b'O', Set::Ids(a), true) => a.iter().for_each(|&d| r[d as usize / 64] |= 1 << (d % 64)),
+            (_, Set::Ids(a), true) => a.iter().for_each(|&d| r[d as usize / 64] &= !(1 << (d % 64))),
+            (_, Set::Bits(b), true) => r.iter_mut().zip(b).for_each(|(x, &y)| *x = match op {
+                b'A' => *x & y,
+                b'O' => *x | y,
+                _ => *x & !y,
+            }),
         }
     }
     if dense {
@@ -365,13 +349,13 @@ fn main() {
             .map(|block| {
                 let (set, span) = (&set, &span);
                 s.spawn(move || {
-                    let (mut r, mut v, mut tmp, mut out) = (vec![0u64; words], Vec::new(), Vec::new(), Vec::new());
+                    let (mut r, mut v, mut out) = (vec![0u64; words], Vec::new(), Vec::new());
                     for (ops, ids, phrase) in block {
                         if phrase.is_empty() {
-                            eval(ops.iter().zip(ids).map(|(&op, &id)| (op, set(id as usize))), &mut r, &mut v, &mut tmp);
+                            eval(ops.iter().zip(ids).map(|(&op, &id)| (op, set(id as usize))), &mut r, &mut v);
                         } else {
                             let steps = ids.iter().enumerate().map(|(j, &p)| (if j == 0 { b'=' } else { b'A' }, set(nt + p as usize)));
-                            eval(steps, &mut r, &mut v, &mut tmp);
+                            eval(steps, &mut r, &mut v);
                             if phrase.len() > 2 {
                                 // Every adjacent pair occurs; check the words occur together, in order.
                                 v.retain(|&d| {
