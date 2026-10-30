@@ -73,10 +73,21 @@ impl Table {
     }
 }
 
-/// A 64-bit hash of a lowercased token stands in for the token itself. For a letter or digit,
-/// c | 0x20 is its lowercase.
+/// A token byte's lowercase, or 0 for a separator (for a letter or digit, c | 0x20 is its lowercase).
+const LOWER: [u8; 256] = {
+    let (mut t, mut c) = ([0u8; 256], 0);
+    while c < 256 {
+        if (c as u8).is_ascii_alphanumeric() {
+            t[c] = c as u8 | 0x20;
+        }
+        c += 1;
+    }
+    t
+};
+
+/// A 64-bit hash of a lowercased token stands in for the token itself.
 fn step(h: u64, c: u8) -> u64 {
-    (h ^ (c | 0x20) as u64).wrapping_mul(0x100_0000_01b3)
+    (h ^ LOWER[c as usize] as u64).wrapping_mul(0x100_0000_01b3)
 }
 const SEED: u64 = 0xcbf2_9ce4_8422_2325;
 
@@ -138,12 +149,12 @@ impl Index<'_> {
             };
             let (mut j, mut prev) = (tab + 1, None);
             while j < end {
-                if !b[j].is_ascii_alphanumeric() {
+                if LOWER[b[j] as usize] == 0 {
                     j += 1;
                     continue;
                 }
                 let mut h = SEED;
-                while b[j].is_ascii_alphanumeric() {
+                while LOWER[b[j] as usize] != 0 {
                     h = step(h, b[j]);
                     j += 1;
                 }
@@ -227,15 +238,15 @@ fn main() {
         })
     };
 
-    // A sample, the first sixteenth of every part, estimates which ids are common. Those get a
+    // A sample, the first thirty-second of every part, estimates which ids are common. Those get a
     // bitset over all documents, which the full pass sets directly.
     let sample = each(&|j, state| {
-        index.scan(parts[j], parts[j] + (parts[j + 1] - parts[j]) / 16, state, &span, |_, _, c| *c += 1);
+        index.scan(parts[j], parts[j] + (parts[j + 1] - parts[j]) / 32, state, &span, |_, _, c| *c += 1);
         state.iter().map(|s| s.1).collect()
     });
     let mut nbits = 0;
     let bit_of: Vec<Option<usize>> = (0..ids)
-        .map(|id| (sample.iter().map(|s| s[id] as usize).sum::<usize>() * 16 * 32 >= n).then(|| (nbits, nbits += 1).0))
+        .map(|id| (sample.iter().map(|s| s[id] as usize).sum::<usize>() * 32 * 32 >= n).then(|| (nbits, nbits += 1).0))
         .collect();
     let bits: Vec<AtomicU64> = (0..nbits * words).map(|_| AtomicU64::new(0)).collect();
 
@@ -243,7 +254,7 @@ fn main() {
     // its id, after a marker (top bit set) naming the document.
     let streams = each(&|j, state| {
         let rare: usize = (0..ids).filter(|&id| bit_of[id].is_none()).map(|id| sample[j][id] as usize).sum();
-        let (mut stream, mut last) = (Vec::with_capacity(rare * 17 + n / k), u32::MAX);
+        let (mut stream, mut last) = (Vec::with_capacity(rare * 33 + n / k), u32::MAX);
         index.scan(parts[j], parts[j + 1], state, &span, |doc, id, _| match bit_of[id] {
             Some(b) => {
                 let w = &bits[b * words + doc as usize / 64];
@@ -258,6 +269,7 @@ fn main() {
         });
         stream
     });
+    drop(sample);
 
     // The other ids get a run of one flat array: count each thread's hits per id, then each
     // thread places its stream into its own part of every run.
