@@ -50,30 +50,31 @@ fn hour_text(hour: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{:02}:00:00Z", hour % 24)
 }
 
-/// Endpoints, interned into one lock-free open-addressing table shared by all threads.
-/// A slot holds (offset + 1) << 8 | length of the endpoint's first occurrence in the file.
+/// Endpoints, interned into one lock-free open-addressing table shared by all threads. A slot
+/// holds the endpoint's 64-bit hash, which identifies it among the 1,842 (a collision is about
+/// 1 in 10^13), and `at` holds offset << 8 | length of one occurrence in the file.
 struct Endpoints<'a> {
     b: &'a [u8],
     slots: Vec<AtomicU64>,
+    at: Vec<AtomicU64>,
 }
 
 impl Endpoints<'_> {
     fn id(&self, at: usize, len: usize, hash: u64) -> usize {
-        let key = &self.b[at..at + len];
-        let same = |v: u64| v & 0xff == len as u64 && &self.b[(v >> 8) as usize - 1..][..len] == key;
-        let mut s = (hash.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 52) as usize;
+        let (key, mut s) = (hash | 1, (hash.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 52) as usize);
         loop {
-            let v = self.slots[s].load(Relaxed);
-            if v == 0 {
-                match self.slots[s].compare_exchange(0, (at as u64 + 1) << 8 | len as u64, Relaxed, Relaxed) {
-                    Ok(_) => return s,
-                    Err(v) if same(v) => return s,
+            match self.slots[s].load(Relaxed) {
+                v if v == key => return s,
+                0 => match self.slots[s].compare_exchange(0, key, Relaxed, Relaxed) {
+                    Ok(_) => {
+                        self.at[s].store((at as u64) << 8 | len as u64, Relaxed);
+                        return s;
+                    }
+                    Err(v) if v == key => return s,
                     Err(_) => {}
-                }
-            } else if same(v) {
-                return s;
+                },
+                _ => s = (s + 1) % SLOTS,
             }
-            s = (s + 1) % SLOTS;
         }
     }
 
@@ -111,7 +112,8 @@ impl Endpoints<'_> {
 
 fn main() {
     let b = map("/data/requests.log");
-    let ep = Endpoints { b, slots: (0..SLOTS).map(|_| AtomicU64::new(0)).collect() };
+    let new = || (0..SLOTS).map(|_| AtomicU64::new(0)).collect();
+    let ep = Endpoints { b, slots: new(), at: new() };
     let base = day(b"2026-10-30") * 24 + 18;
     let k = thread::available_parallelism().map_or(1, |x| x.get());
     let next = |p: usize| p + b[p..].iter().position(|&c| c == b'\n').map_or(b.len() - p, |x| x + 1);
@@ -168,8 +170,8 @@ fn main() {
     let mut eps: Vec<(&[u8], usize)> = used
         .iter()
         .map(|&s| {
-            let v = ep.slots[s].load(Relaxed);
-            (&b[(v >> 8) as usize - 1..][..(v & 0xff) as usize], s)
+            let v = ep.at[s].load(Relaxed);
+            (&b[(v >> 8) as usize..][..(v & 0xff) as usize], s)
         })
         .collect();
     eps.sort_unstable();
