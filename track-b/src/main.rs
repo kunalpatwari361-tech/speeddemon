@@ -198,6 +198,52 @@ fn apply(r: &mut [u64], op: u8, s: Set, keep: &mut Vec<u32>) {
     }
 }
 
+/// Evaluates (operator, set) steps left to right into v, as ascending ids. The result stays a
+/// list while it can, and moves to the bitset r only to load or OR in a common term.
+fn eval<'a>(steps: impl Iterator<Item = (u8, Set<'a>)>, r: &mut [u64], v: &mut Vec<u32>, tmp: &mut Vec<u32>) {
+    let mut dense = false;
+    for (op, s) in steps {
+        if !dense {
+            match (op, &s) {
+                (b'=', Set::Ids(a)) => (v.clear(), v.extend_from_slice(a)).0,
+                (b'A' | b'N', Set::Bits(b)) => v.retain(|&d| (b[d as usize / 64] >> (d % 64) & 1 == 1) == (op == b'A')),
+                (b'A' | b'N', Set::Ids(a)) => {
+                    let mut i = 0;
+                    v.retain(|&d| {
+                        while i < a.len() && a[i] < d {
+                            i += 1;
+                        }
+                        (i < a.len() && a[i] == d) == (op == b'A')
+                    });
+                }
+                (b'O', Set::Ids(a)) => {
+                    v.extend_from_slice(a);
+                    v.sort_unstable();
+                    v.dedup();
+                }
+                _ => {
+                    r.fill(0);
+                    v.iter().for_each(|&d| r[d as usize / 64] |= 1 << (d % 64));
+                    dense = true;
+                }
+            }
+        }
+        if dense {
+            apply(r, op, s, tmp);
+        }
+    }
+    if dense {
+        v.clear();
+        for (wi, &w) in r.iter().enumerate() {
+            let mut x = w;
+            while x != 0 {
+                v.push((wi * 64) as u32 + x.trailing_zeros());
+                x &= x - 1;
+            }
+        }
+    }
+}
+
 fn main() {
     let (docs, q) = (map("/data/docs.txt"), map("/data/queries.txt"));
 
@@ -319,48 +365,24 @@ fn main() {
             .map(|block| {
                 let (set, span) = (&set, &span);
                 s.spawn(move || {
-                    let (mut r, mut keep, mut out) = (vec![0u64; words], Vec::new(), Vec::new());
+                    let (mut r, mut v, mut tmp, mut out) = (vec![0u64; words], Vec::new(), Vec::new(), Vec::new());
                     for (ops, ids, phrase) in block {
                         if phrase.is_empty() {
-                            for (&op, &id) in ops.iter().zip(ids) {
-                                apply(&mut r, op, set(id as usize), &mut keep);
-                            }
+                            eval(ops.iter().zip(ids).map(|(&op, &id)| (op, set(id as usize))), &mut r, &mut v, &mut tmp);
                         } else {
-                            for (j, &p) in ids.iter().enumerate() {
-                                apply(&mut r, if j == 0 { b'=' } else { b'A' }, set(nt + p as usize), &mut keep);
-                            }
+                            let steps = ids.iter().enumerate().map(|(j, &p)| (if j == 0 { b'=' } else { b'A' }, set(nt + p as usize)));
+                            eval(steps, &mut r, &mut v, &mut tmp);
                             if phrase.len() > 2 {
                                 // Every adjacent pair occurs; check the words occur together, in order.
-                                for wi in 0..words {
-                                    let mut x = r[wi];
-                                    while x != 0 {
-                                        let d = wi * 64 + x.trailing_zeros() as usize;
-                                        x &= x - 1;
-                                        let sp = span[d].load(Relaxed);
-                                        let toks: Vec<&[u8]> = tokens(&docs[(sp >> 32) as usize..sp as u32 as usize]).collect();
-                                        let found = toks.windows(phrase.len()).any(|w| w.iter().zip(phrase).all(|(a, b)| a.eq_ignore_ascii_case(b)));
-                                        if !found {
-                                            r[wi] &= !(1 << (d % 64));
-                                        }
-                                    }
-                                }
+                                v.retain(|&d| {
+                                    let sp = span[d as usize].load(Relaxed);
+                                    let toks: Vec<&[u8]> = tokens(&docs[(sp >> 32) as usize..sp as u32 as usize]).collect();
+                                    toks.windows(phrase.len()).any(|w| w.iter().zip(phrase).all(|(a, b)| a.eq_ignore_ascii_case(b)))
+                                });
                             }
                         }
-                        let (mut count, mut sum, mut first) = (0u64, 0u64, Vec::new());
-                        for (wi, &w) in r.iter().enumerate() {
-                            let mut x = w;
-                            count += x.count_ones() as u64;
-                            while x != 0 {
-                                let d = wi * 64 + x.trailing_zeros() as usize;
-                                sum += d as u64;
-                                if first.len() < 10 {
-                                    first.push(d);
-                                }
-                                x &= x - 1;
-                            }
-                        }
-                        write!(out, "{count} {sum}").unwrap();
-                        first.iter().for_each(|d| write!(out, " {d}").unwrap());
+                        write!(out, "{} {}", v.len(), v.iter().map(|&d| d as u64).sum::<u64>()).unwrap();
+                        v.iter().take(10).for_each(|d| write!(out, " {d}").unwrap());
                         out.push(b'\n');
                     }
                     out

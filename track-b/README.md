@@ -14,7 +14,7 @@ The corpus is split into one part per hardware thread, each starting at a docume
 2. The full pass sets common ids' bits directly. Thanks to the 64-document alignment, no two threads ever write the same bitset word, so the writes need no atomic read-modify-write. Every other hit is appended to the thread's stream as a 4-byte id, after a marker naming its document.
 3. Each thread counts its stream's hits per id. The counts give each thread its own part of every id's run in one flat array of ascending document ids, and each thread places its stream there.
 
-A `BOOL` query is evaluated left to right on a bitset result, combining it with each term's bitset or id list. A `PHRASE` of two terms is exactly the documents holding that adjacent pair. A longer phrase starts from the documents holding all of its pairs, which are very few, and checks each one's tokens for the whole sequence.
+A `BOOL` query is evaluated left to right. The result stays a sorted list of ids while it can: AND and NOT filter it, and an OR with another list merges into it. It moves to a bitset only to load or OR in a common term. A `PHRASE` of two terms is exactly the documents holding that adjacent pair. A longer phrase starts from the documents holding all of its pairs, which are very few, and checks each one's tokens for the whole sequence.
 
 ## Dependencies
 
