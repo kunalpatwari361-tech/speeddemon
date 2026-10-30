@@ -12,6 +12,8 @@ Node ids are a random relabelling, so a search would jump all over memory. Befor
 
 Queries run in parallel, one per thread at a time, each a Dijkstra search that stops when the target is settled. The heap holds distance and node packed in one 64-bit key. Each thread keeps 32-bit distances, which halves its table; the few searches that pass 2^32 near the edges of weight about 2^32 are redone, one at a time, over a single shared 64-bit table. A target with no in-edges is answered `-1` without searching, which is what would otherwise make a search settle the whole graph.
 
+The binary is built for the scoring CPU (`target-cpu=native`).
+
 ## Dependencies
 
 None.
