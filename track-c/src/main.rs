@@ -29,6 +29,19 @@ fn num(b: &[u8], i: &mut usize) -> u64 {
     v
 }
 
+/// The first `"` at or after i, 8 bytes at a time: it is the first zero byte of a word xored
+/// with quotes. A record's end follows every quote, so every 8-byte read is in bounds.
+fn quote(b: &[u8], mut i: usize) -> usize {
+    loop {
+        let x = u64::from_le_bytes(b[i..i + 8].try_into().unwrap()) ^ 0x2222_2222_2222_2222;
+        let found = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
+        if found != 0 {
+            return i + found.trailing_zeros() as usize / 8;
+        }
+        i += 8;
+    }
+}
+
 /// A text field at b[*i] as (start, raw length, value length); leaves *i past its comma.
 /// The raw bytes of a quoted field identify its value, since escaping is one to one.
 fn field(b: &[u8], i: &mut usize) -> (usize, usize, u64) {
@@ -39,7 +52,7 @@ fn field(b: &[u8], i: &mut usize) -> (usize, usize, u64) {
     }
     let (mut j, mut escapes) = (start + 1, 0);
     loop {
-        j += b[j..].iter().position(|&c| c == b'"').unwrap();
+        j = quote(b, j);
         if b[j + 1] != b'"' {
             break;
         }
