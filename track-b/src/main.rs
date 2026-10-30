@@ -18,15 +18,23 @@ fn map(path: &str) -> &'static [u8] {
     unsafe { std::slice::from_raw_parts(mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0), len) }
 }
 
-/// Open addressing from a non-zero 64-bit key to a dense id, in insertion order.
+/// Open addressing from a non-zero 64-bit key to a dense id, in insertion order, behind a 64 KB
+/// one-bit-per-hash filter that answers most misses without touching the table.
 struct Table {
     slots: Vec<(u64, u32)>,
+    filter: Vec<u64>,
     len: u32,
+}
+
+/// The filter bit of a key: 19 bits of a second hash.
+fn bit(key: u64) -> (usize, u64) {
+    let h = (key.wrapping_mul(0xff51_afd7_ed55_8ccd) >> 45) as usize;
+    (h / 64, 1 << (h % 64))
 }
 
 impl Table {
     fn new(cap: usize) -> Self {
-        Table { slots: vec![(0, 0); (cap * 2).next_power_of_two()], len: 0 }
+        Table { slots: vec![(0, 0); (cap * 2).next_power_of_two()], filter: vec![0; 1 << 13], len: 0 }
     }
     fn slot(&self, key: u64) -> usize {
         let mask = self.slots.len() - 1;
@@ -37,11 +45,16 @@ impl Table {
         s
     }
     fn get(&self, key: u64) -> Option<u32> {
+        let (w, b) = bit(key);
+        if self.filter[w] & b == 0 {
+            return None;
+        }
         let (k, id) = self.slots[self.slot(key)];
         (k != 0).then_some(id)
     }
     fn add(&mut self, key: u64) -> u32 {
-        let s = self.slot(key);
+        let (s, (w, b)) = (self.slot(key), bit(key));
+        self.filter[w] |= b;
         if self.slots[s].0 == 0 {
             (self.slots[s], self.len) = ((key, self.len), self.len + 1);
         }
@@ -50,6 +63,7 @@ impl Table {
     /// The same map in the smallest table that holds it, so lookups stay in cache.
     fn compact(&self) -> Table {
         let mut t = Table::new(self.len as usize);
+        t.filter.clone_from(&self.filter);
         for &(k, id) in self.slots.iter().filter(|s| s.0 != 0) {
             let s = t.slot(k);
             t.slots[s] = (k, id);
