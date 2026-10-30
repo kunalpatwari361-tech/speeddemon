@@ -91,11 +91,21 @@ impl Endpoints<'_> {
             while b[j] != b' ' {
                 j += 1;
             }
-            let (at, mut hash) = (j + 1, 0xcbf2_9ce4_8422_2325u64);
+            // The endpoint, 8 bytes at a time: a word's first space is its first zero byte after
+            // xor with spaces. At least " 200 0\n" follows it, so every 8-byte read is in bounds.
+            let (at, mut hash) = (j + 1, 0u64);
             j += 1;
-            while b[j] != b' ' {
-                hash = (hash ^ b[j] as u64).wrapping_mul(0x100_0000_01b3);
-                j += 1;
+            loop {
+                let w = u64::from_le_bytes(b[j..j + 8].try_into().unwrap());
+                let x = w ^ 0x2020_2020_2020_2020;
+                let space = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
+                let n = if space == 0 { 8 } else { space.trailing_zeros() as usize / 8 };
+                let keep = if n == 8 { u64::MAX } else { (1 << (8 * n)) - 1 };
+                hash = (hash ^ w & keep).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(23);
+                j += n;
+                if n < 8 {
+                    break;
+                }
             }
             let g = self.id(at, j - at, hash) * HOURS + h;
             let (error, mut lat) = (b[j + 1] == b'5', 0u32);
@@ -144,11 +154,21 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).unzip()
     });
 
-    // Every group's latencies get one run of a flat array; each thread fills its own part of every run.
-    let used: Vec<usize> = (0..SLOTS).filter(|&s| ep.slots[s].load(Relaxed) != 0).collect();
+    // Endpoints in byte order.
+    let mut eps: Vec<(&[u8], usize)> = (0..SLOTS)
+        .filter(|&s| ep.slots[s].load(Relaxed) != 0)
+        .map(|s| {
+            let v = ep.at[s].load(Relaxed);
+            (&b[(v >> 8) as usize..][..(v & 0xff) as usize], s)
+        })
+        .collect();
+    eps.sort_unstable();
+
+    // Every group's latencies get one run of a flat array, laid out in output order; each thread
+    // fills its own part of every run.
     let (mut start, mut end) = (vec![0u32; SLOTS * HOURS], vec![0u32; SLOTS * HOURS]);
     let (mut cursors, mut at) = (counts, 0);
-    for g in used.iter().flat_map(|s| s * HOURS..(s + 1) * HOURS) {
+    for g in (0..HOURS).flat_map(|h| eps.iter().map(move |&(_, s)| s * HOURS + h)) {
         start[g] = at;
         for c in cursors.iter_mut() {
             (c[g], at) = (at, at + c[g]);
@@ -169,15 +189,7 @@ fn main() {
         }
     });
 
-    // Endpoints in byte order; hours split across threads, each formatting its lines.
-    let mut eps: Vec<(&[u8], usize)> = used
-        .iter()
-        .map(|&s| {
-            let v = ep.at[s].load(Relaxed);
-            (&b[(v >> 8) as usize..][..(v & 0xff) as usize], s)
-        })
-        .collect();
-    eps.sort_unstable();
+    // Hours split across threads, each formatting its lines.
     let outs: Vec<Vec<u8>> = thread::scope(|s| {
         let hs: Vec<_> = (0..k)
             .map(|j| {
