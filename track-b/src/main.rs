@@ -104,9 +104,10 @@ struct Index<'a> {
 }
 
 impl Index<'_> {
-    /// Calls f(doc, id) once per document for every query term and phrase pair it contains.
-    /// Pair ids follow the term ids. Also records where each document's text lies.
-    fn scan(&self, from: usize, to: usize, last: &mut [u32], span: &[AtomicU64], mut f: impl FnMut(u32, usize)) {
+    /// Calls f(doc, id, value) once per document for every query term and phrase pair it
+    /// contains; pair ids follow the term ids. state[id] is (last document + 1, value), kept
+    /// together so a hit touches one place. Also records where each document's text lies.
+    fn scan(&self, from: usize, to: usize, state: &mut [(u32, u32)], span: &[AtomicU64], mut f: impl FnMut(u32, usize, &mut u32)) {
         let (b, nt) = (self.docs, self.terms.len as usize);
         let mut i = from;
         while i < to {
@@ -115,9 +116,10 @@ impl Index<'_> {
             let doc = b[i..tab].iter().fold(0, |v, &c| v * 10 + (c - b'0') as u32);
             span[doc as usize].store((tab as u64 + 1) << 32 | end as u64, Relaxed);
             let mut hit = |id: usize| {
-                if last[id] != doc + 1 {
-                    last[id] = doc + 1;
-                    f(doc, id);
+                let e = &mut state[id];
+                if e.0 != doc + 1 {
+                    e.0 = doc + 1;
+                    f(doc, id, &mut e.1);
                 }
             };
             let (mut j, mut prev) = (tab + 1, None);
@@ -204,49 +206,51 @@ fn main() {
     let parts = cuts(docs, k);
 
     // Pass 1: document frequency of every id, per thread.
-    let counts: Vec<Vec<u32>> = thread::scope(|s| {
+    let mut states: Vec<Vec<(u32, u32)>> = thread::scope(|s| {
         let hs: Vec<_> = parts
             .windows(2)
             .map(|w| {
                 let (index, span) = (&index, &span);
                 s.spawn(move || {
-                    let (mut last, mut count) = (vec![0; ids], vec![0u32; ids]);
-                    index.scan(w[0], w[1], &mut last, span, |_, id| count[id] += 1);
-                    count
+                    let mut state = vec![(0, 0); ids];
+                    index.scan(w[0], w[1], &mut state, span, |_, _, count| *count += 1);
+                    state
                 })
             })
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // Common ids get a bitset; the rest a slice of one flat id array, each thread writing its own run.
-    let df: Vec<usize> = (0..ids).map(|id| counts.iter().map(|c| c[id] as usize).sum()).collect();
-    let dense: Vec<bool> = df.iter().map(|&d| d * 32 >= n).collect();
-    let mut slot = vec![0usize; ids];
+    // Common ids get a bitset; the rest a run of one flat id array, each thread writing its own
+    // part of it: its state becomes (0, where its part starts).
+    let df: Vec<usize> = (0..ids).map(|id| states.iter().map(|s| s[id].1 as usize).sum()).collect();
     let (mut nbits, mut nflat) = (0, 0);
-    for id in 0..ids {
-        slot[id] = if dense[id] { nbits += 1; nbits - 1 } else { nflat += df[id]; nflat - df[id] };
-    }
-    let cursors: Vec<Vec<usize>> = (0..parts.len() - 1)
-        .map(|j| (0..ids).map(|id| slot[id] + counts[..j].iter().map(|c| c[id] as usize).sum::<usize>()).collect())
+    let place: Vec<(Option<usize>, usize)> = df
+        .iter()
+        .map(|&d| if d * 32 >= n { (Some(nbits), { nbits += 1; 0 }) } else { (None, { nflat += d; nflat - d }) })
         .collect();
-    drop(counts);
+    for id in 0..ids {
+        let mut at = place[id].1 as u32;
+        for s in states.iter_mut() {
+            (s[id], at) = ((0, at), at + s[id].1);
+        }
+    }
     let bits: Vec<AtomicU64> = (0..nbits * words).map(|_| AtomicU64::new(0)).collect();
     let flat: Vec<AtomicU32> = (0..nflat).map(|_| AtomicU32::new(0)).collect();
 
     // Pass 2: fill them.
     thread::scope(|s| {
-        for (w, mut cur) in parts.windows(2).zip(cursors) {
-            let (index, span, dense, slot, bits, flat) = (&index, &span, &dense, &slot, &bits, &flat);
+        for (w, mut state) in parts.windows(2).zip(states) {
+            let (index, span, place, bits, flat) = (&index, &span, &place, &bits, &flat);
             s.spawn(move || {
-                let mut last = vec![0; ids];
-                index.scan(w[0], w[1], &mut last, span, |doc, id| {
-                    if dense[id] {
-                        let w = &bits[slot[id] * words + doc as usize / 64];
+                index.scan(w[0], w[1], &mut state, span, |doc, id, cur| match place[id].0 {
+                    Some(b) => {
+                        let w = &bits[b * words + doc as usize / 64];
                         w.store(w.load(Relaxed) | 1 << (doc % 64), Relaxed);
-                    } else {
-                        flat[cur[id]].store(doc, Relaxed);
-                        cur[id] += 1;
+                    }
+                    None => {
+                        flat[*cur as usize].store(doc, Relaxed);
+                        *cur += 1;
                     }
                 });
             });
@@ -254,12 +258,9 @@ fn main() {
     });
     let bits: Vec<u64> = bits.into_iter().map(AtomicU64::into_inner).collect();
     let flat: Vec<u32> = flat.into_iter().map(AtomicU32::into_inner).collect();
-    let set = |id: usize| {
-        if dense[id] {
-            Set::Bits(&bits[slot[id] * words..][..words])
-        } else {
-            Set::Ids(&flat[slot[id]..slot[id] + df[id]])
-        }
+    let set = |id: usize| match place[id] {
+        (Some(b), _) => Set::Bits(&bits[b * words..][..words]),
+        (None, at) => Set::Ids(&flat[at..at + df[id]]),
     };
 
     // Answer the queries in k contiguous blocks, each into its own buffer.
