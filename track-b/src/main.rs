@@ -105,21 +105,20 @@ fn tokens(text: &[u8]) -> impl Iterator<Item = &[u8]> {
 /// multiple of 64, so no two parts ever touch the same bitset word.
 fn cuts(b: &[u8], k: usize) -> Vec<usize> {
     let next = |p: usize| p + b[p..].iter().position(|&c| c == b'\n').map_or(b.len() - p, |x| x + 1);
-    let id = |p: usize| b[p..].iter().take_while(|c| c.is_ascii_digit()).fold(0, |v, &c| v * 10 + (c - b'0') as usize);
-    let mut v: Vec<usize> = (0..k)
-        .map(|j| {
-            let mut p = b.len() * j / k;
-            if p > 0 {
-                p = next(p);
-            }
-            while p < b.len() && id(p) % 64 != 0 {
-                p = next(p);
-            }
-            p
-        })
-        .collect();
+    let mut v: Vec<usize> = (0..k).map(|j| (b.len() * j / k).saturating_sub(1)).collect();
+    for p in v.iter_mut() {
+        *p = if *p == 0 { 0 } else { next(*p) };
+        while *p < b.len() && num(&b[*p..]) % 64 != 0 {
+            *p = next(*p);
+        }
+    }
     v.push(b.len());
     v
+}
+
+/// The decimal number the bytes start with.
+fn num(b: &[u8]) -> usize {
+    b.iter().take_while(|c| c.is_ascii_digit()).fold(0, |v, &c| v * 10 + (c - b'0') as usize)
 }
 
 struct Index<'a> {
@@ -138,7 +137,7 @@ impl Index<'_> {
         while i < to {
             let tab = i + b[i..].iter().position(|&c| c == b'\t').unwrap();
             let end = tab + b[tab..].iter().position(|&c| c == b'\n').unwrap();
-            let doc = b[i..tab].iter().fold(0, |v, &c| v * 10 + (c - b'0') as u32);
+            let doc = num(&b[i..]) as u32;
             span[doc as usize].store((tab as u64 + 1) << 32 | end as u64, Relaxed);
             let mut hit = |id: usize| {
                 let e = &mut state[id];
@@ -231,7 +230,8 @@ fn eval<'a>(steps: impl Iterator<Item = (u8, Set<'a>)>, r: &mut [u64], v: &mut V
 fn main() {
     let (docs, q) = (map("/data/docs.txt"), map("/data/queries.txt"));
 
-    // Queries: a BOOL keeps its term ids and operators, a PHRASE its words and the ids of its adjacent pairs.
+    // Every query becomes (operator, id) steps: a BOOL's terms as written, a PHRASE's adjacent pairs
+    // ANDed (a pair id has the top bit set). A PHRASE also keeps its words, to check longer ones.
     let words_in_queries = q.iter().filter(|&&c| c == b' ').count();
     let (mut terms, mut pairs) = (Table::new(words_in_queries), Table::new(words_in_queries));
     let mut queries = Vec::new();
@@ -240,21 +240,20 @@ fn main() {
         let rest = if phrase { &line[8..line.len() - 1] } else { &line[5..] };
         let words: Vec<&[u8]> = rest.split(|&c| c == b' ').collect();
         let mut id = |w: &[u8]| terms.add(w.iter().fold(SEED, |h, &c| step(h, c)) | 1);
-        if phrase {
+        let steps: Vec<(u8, u32)> = if phrase {
             let ids: Vec<u32> = words.iter().map(|w| id(w)).collect();
-            let pair_ids: Vec<u32> = ids.windows(2).map(|p| pairs.add(pair(p[0], p[1]))).collect();
-            queries.push((Vec::new(), pair_ids, words));
+            let pair_ids = ids.windows(2).map(|p| pairs.add(pair(p[0], p[1])) | 1 << 31);
+            pair_ids.enumerate().map(|(j, p)| (if j == 0 { b'=' } else { b'A' }, p)).collect()
         } else {
-            let ops: Vec<u8> = std::iter::once(b'=').chain(words.iter().skip(1).step_by(2).map(|o| o[0])).collect();
-            let ids: Vec<u32> = words.iter().step_by(2).map(|w| id(w)).collect();
-            queries.push((ops, ids, Vec::new()));
-        }
+            let ops = std::iter::once(b'=').chain(words.iter().skip(1).step_by(2).map(|o| o[0]));
+            ops.zip(words.iter().step_by(2)).map(|(op, w)| (op, id(w))).collect()
+        };
+        queries.push((steps, if phrase { words } else { Vec::new() }));
     }
 
     let index = Index { docs, terms: terms.compact(), pairs: pairs.compact() };
     let ids = (index.terms.len + index.pairs.len) as usize;
-    let n = docs[..docs.len().saturating_sub(1)].iter().rposition(|&c| c == b'\n').map_or(0, |p| p + 1);
-    let n = if docs.is_empty() { 0 } else { docs[n..].iter().take_while(|c| c.is_ascii_digit()).fold(0, |v, &c| v * 10 + (c - b'0') as usize) + 1 };
+    let n = docs.rsplit(|&c| c == b'\n').nth(1).map_or(0, |last| num(last) + 1); // the last id + 1
     let words = n.div_ceil(64);
     let span: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(0)).collect();
     let k = thread::available_parallelism().map_or(1, |x| x.get());
@@ -336,13 +335,16 @@ fn main() {
     });
     let bits: Vec<u64> = bits.into_iter().map(AtomicU64::into_inner).collect();
     let flat: Vec<u32> = flat.into_iter().map(AtomicU32::into_inner).collect();
-    let set = |id: usize| match bit_of[id] {
-        Some(b) => Set::Bits(&bits[b * words..][..words]),
-        None => Set::Ids(&flat[start[id]..start[id] + df[id]]),
+    let nt = index.terms.len;
+    let set = |id: u32| {
+        let id = if id >> 31 == 1 { (nt + (id & !(1 << 31))) as usize } else { id as usize };
+        match bit_of[id] {
+            Some(b) => Set::Bits(&bits[b * words..][..words]),
+            None => Set::Ids(&flat[start[id]..start[id] + df[id]]),
+        }
     };
 
     // Answer the queries in k contiguous blocks, each into its own buffer.
-    let nt = index.terms.len as usize;
     let outs: Vec<Vec<u8>> = thread::scope(|s| {
         let hs: Vec<_> = queries
             .chunks(queries.len().div_ceil(k).max(1))
@@ -350,22 +352,18 @@ fn main() {
                 let (set, span) = (&set, &span);
                 s.spawn(move || {
                     let (mut r, mut v, mut out) = (vec![0u64; words], Vec::new(), Vec::new());
-                    for (ops, ids, phrase) in block {
-                        if phrase.is_empty() {
-                            eval(ops.iter().zip(ids).map(|(&op, &id)| (op, set(id as usize))), &mut r, &mut v);
-                        } else {
-                            let steps = ids.iter().enumerate().map(|(j, &p)| (if j == 0 { b'=' } else { b'A' }, set(nt + p as usize)));
-                            eval(steps, &mut r, &mut v);
-                            if phrase.len() > 2 {
-                                // Every adjacent pair occurs; check the words occur together, in order.
-                                v.retain(|&d| {
-                                    let sp = span[d as usize].load(Relaxed);
-                                    let toks: Vec<&[u8]> = tokens(&docs[(sp >> 32) as usize..sp as u32 as usize]).collect();
-                                    toks.windows(phrase.len()).any(|w| w.iter().zip(phrase).all(|(a, b)| a.eq_ignore_ascii_case(b)))
-                                });
-                            }
+                    for (steps, phrase) in block {
+                        eval(steps.iter().map(|&(op, id)| (op, set(id))), &mut r, &mut v);
+                        if phrase.len() > 2 {
+                            // Every adjacent pair occurs; check the words occur together, in order.
+                            v.retain(|&d| {
+                                let sp = span[d as usize].load(Relaxed);
+                                let toks: Vec<&[u8]> = tokens(&docs[(sp >> 32) as usize..sp as u32 as usize]).collect();
+                                toks.windows(phrase.len()).any(|w| w.iter().zip(phrase).all(|(a, b)| a.eq_ignore_ascii_case(b)))
+                            });
                         }
-                        write!(out, "{} {}", v.len(), v.iter().map(|&d| d as u64).sum::<u64>()).unwrap();
+                        let sum: u64 = v.iter().map(|&d| d as u64).sum();
+                        write!(out, "{} {sum}", v.len()).unwrap();
                         v.iter().take(10).for_each(|d| write!(out, " {d}").unwrap());
                         out.push(b'\n');
                     }
@@ -375,5 +373,5 @@ fn main() {
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    File::create("/out/results.txt").unwrap().write_all(&outs.concat()).unwrap();
+    std::fs::write("/out/results.txt", outs.concat()).unwrap();
 }
