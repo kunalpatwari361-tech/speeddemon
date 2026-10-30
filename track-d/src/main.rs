@@ -20,6 +20,13 @@ fn map(path: &str) -> &'static [u8] {
     unsafe { std::slice::from_raw_parts(mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0), len) }
 }
 
+/// n zeroed atomic integers (all-zero bytes are a valid value), whose pages the kernel supplies
+/// only when first touched.
+fn zeroed<T>(n: usize) -> Vec<T> {
+    let layout = std::alloc::Layout::array::<T>(n.max(1)).unwrap();
+    unsafe { Vec::from_raw_parts(std::alloc::alloc_zeroed(layout) as *mut T, n, n.max(1)) }
+}
+
 /// Reads one unsigned integer at b[*i] and steps over the byte after it.
 fn num(b: &[u8], i: &mut usize) -> u64 {
     let mut v = 0;
@@ -96,8 +103,7 @@ fn main() {
     let parts = cuts(g, i, k);
     // Compressed adjacency: parse each part once into edge triples, counting out-degrees and
     // marking nodes with in-edges, then place every edge from the triples.
-    let deg: Vec<AtomicU32> = (0..=n).map(|_| AtomicU32::new(0)).collect();
-    let has_in: Vec<AtomicU64> = (0..n / 64 + 1).map(|_| AtomicU64::new(0)).collect();
+    let (deg, has_in): (Vec<AtomicU32>, Vec<AtomicU64>) = (zeroed(n + 1), zeroed(n / 64 + 1));
     let lists: Vec<Vec<[u32; 3]>> = thread::scope(|s| {
         let hs: Vec<_> = parts
             .windows(2)
@@ -122,7 +128,7 @@ fn main() {
         off[j] += off[j - 1];
     }
     let next: Vec<AtomicU32> = off[..n].iter().map(|&o| AtomicU32::new(o)).collect();
-    let adj: Vec<AtomicU64> = (0..m).map(|_| AtomicU64::new(0)).collect();
+    let adj: Vec<AtomicU64> = zeroed(m);
     thread::scope(|s| {
         for list in lists {
             let (next, adj) = (&next, &adj);
@@ -139,24 +145,21 @@ fn main() {
     // Ids are a random relabelling. Renumber so a search touches nearby memory: k breadth-first
     // searches grow regions in parallel, each claiming unclaimed nodes, and each region gets a
     // contiguous id range. Nodes no region reached go last.
-    let owner: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(u32::MAX)).collect();
-    let mut regions: Vec<Vec<usize>> = thread::scope(|s| {
+    let owner: Vec<AtomicU32> = zeroed(n); // 0: unclaimed, else region + 1
+    let mut regions: Vec<Vec<u32>> = thread::scope(|s| {
         let hs: Vec<_> = (0..k)
             .map(|r| {
                 let (off, adj, owner) = (&off, &adj, &owner);
                 s.spawn(move || {
+                    let claim = |v: usize| owner[v].load(Relaxed) == 0 && owner[v].compare_exchange(0, r as u32 + 1, Relaxed, Relaxed).is_ok();
                     let root = r * n / k;
-                    let mut order = Vec::new();
-                    if owner[root].compare_exchange(u32::MAX, r as u32, Relaxed, Relaxed).is_ok() {
-                        order.push(root);
-                    }
+                    let mut order = if claim(root) { vec![root as u32] } else { Vec::new() };
                     let mut head = 0;
                     while let Some(&u) = order.get(head) {
                         head += 1;
-                        for &e in &adj[off[u] as usize..off[u + 1] as usize] {
-                            let v = (e >> 32) as usize;
-                            if owner[v].load(Relaxed) == u32::MAX && owner[v].compare_exchange(u32::MAX, r as u32, Relaxed, Relaxed).is_ok() {
-                                order.push(v);
+                        for &e in &adj[off[u as usize] as usize..off[u as usize + 1] as usize] {
+                            if claim((e >> 32) as usize) {
+                                order.push((e >> 32) as u32);
                             }
                         }
                     }
@@ -166,35 +169,47 @@ fn main() {
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    regions.push((0..n).filter(|&v| owner[v].load(Relaxed) == u32::MAX).collect());
-    let order: Vec<usize> = regions.concat();
-    let mut new = vec![0u32; n];
-    for (j, &u) in order.iter().enumerate() {
-        new[u] = j as u32;
-    }
-    let mut off2 = vec![0u32; n + 1];
-    for (j, &u) in order.iter().enumerate() {
-        off2[j + 1] = off2[j] + off[u + 1] - off[u];
+    regions.push((0..n as u32).filter(|&v| owner[v as usize].load(Relaxed) == 0).collect());
+    drop(owner);
+
+    // Each region, in parallel, numbers its nodes from its base and records their out-degrees in
+    // the new order; then every region copies its nodes' edges, renamed, into its own range.
+    let (new, deg): (Vec<AtomicU32>, Vec<AtomicU32>) = (zeroed(n), zeroed(n + 1));
+    let base: Vec<usize> = regions.iter().scan(0, |at, r| Some((*at, *at += r.len()).0)).collect();
+    thread::scope(|s| {
+        for (r, &b) in regions.iter().zip(&base) {
+            let (off, new, deg) = (&off, &new, &deg);
+            s.spawn(move || {
+                for (j, &u) in r.iter().enumerate() {
+                    new[u as usize].store((b + j) as u32, Relaxed);
+                    deg[b + j + 1].store(off[u as usize + 1] - off[u as usize], Relaxed);
+                }
+            });
+        }
+    });
+    let new: Vec<u32> = new.into_iter().map(AtomicU32::into_inner).collect();
+    let mut off2: Vec<u32> = deg.into_iter().map(AtomicU32::into_inner).collect();
+    for j in 1..=n {
+        off2[j] += off2[j - 1];
     }
     let mut adj2 = vec![0u64; m];
     thread::scope(|s| {
         let mut rest = &mut adj2[..];
-        for c in order.chunks(n.div_ceil(k).max(1)) {
-            let len = c.iter().map(|&u| (off[u + 1] - off[u]) as usize).sum();
-            let (mine, tail) = std::mem::take(&mut rest).split_at_mut(len);
+        for (r, &b) in regions.iter().zip(&base) {
+            let (mine, tail) = std::mem::take(&mut rest).split_at_mut((off2[b + r.len()] - off2[b]) as usize);
             rest = tail;
             let (off, adj, new) = (&off, &adj, &new);
             s.spawn(move || {
                 let mut out = mine.iter_mut();
-                for &u in c {
-                    for &e in &adj[off[u] as usize..off[u + 1] as usize] {
+                for &u in r {
+                    for &e in &adj[off[u as usize] as usize..off[u as usize + 1] as usize] {
                         *out.next().unwrap() = (new[(e >> 32) as usize] as u64) << 32 | e & 0xffff_ffff;
                     }
                 }
             });
         }
     });
-    drop((off, adj, owner, regions, order));
+    drop((off, adj, regions));
     let (off, adj) = (off2, adj2);
 
     let q = map("/data/queries.txt");
