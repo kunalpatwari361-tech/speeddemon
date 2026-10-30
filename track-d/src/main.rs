@@ -45,32 +45,46 @@ fn cuts(b: &[u8], from: usize, k: usize) -> Vec<usize> {
 const NODE_BITS: u32 = 21;
 
 /// Dijkstra from s, stopping when t is settled. Leaves dist all u64::MAX again.
-fn search(off: &[u32], adj: &[u64], dist: &mut [u64], seen: &mut Vec<usize>, s: usize, t: usize) -> i64 {
+/// Dijkstra from s, stopping when t is settled, over a table of D, whose MAX means unreached.
+/// None if a distance does not fit below D's MAX. Leaves dist all MAX again.
+fn search<D: Copy + Into<u64> + TryFrom<u64>>(
+    off: &[u32],
+    adj: &[u64],
+    dist: &mut [D],
+    max: D,
+    seen: &mut Vec<usize>,
+    s: usize,
+    t: usize,
+) -> Option<i64> {
     let mut heap = BinaryHeap::from([Reverse(s as u64)]);
-    dist[s] = 0;
+    dist[s] = D::try_from(0).ok()?;
     seen.push(s);
-    let mut found = -1;
-    while let Some(Reverse(top)) = heap.pop() {
+    let mut found = Some(-1);
+    'search: while let Some(Reverse(top)) = heap.pop() {
         let (d, u) = (top >> NODE_BITS, (top & ((1 << NODE_BITS) - 1)) as usize);
-        if d > dist[u] {
+        if d > dist[u].into() {
             continue;
         }
         if u == t {
-            found = d as i64;
+            found = Some(d as i64);
             break;
         }
         for &e in &adj[off[u] as usize..off[u + 1] as usize] {
             let (v, nd) = ((e >> 32) as usize, d + (e & 0xffff_ffff));
-            if nd < dist[v] {
-                if dist[v] == u64::MAX {
+            let Some(x) = D::try_from(nd).ok().filter(|_| nd < max.into()) else {
+                found = None;
+                break 'search;
+            };
+            if nd < dist[v].into() {
+                if dist[v].into() == max.into() {
                     seen.push(v);
                 }
-                dist[v] = nd;
+                dist[v] = x;
                 heap.push(Reverse(nd << NODE_BITS | v as u64));
             }
         }
     }
-    seen.drain(..).for_each(|v| dist[v] = u64::MAX);
+    seen.drain(..).for_each(|v| dist[v] = max);
     found
 }
 
@@ -180,19 +194,29 @@ fn main() {
     }
     let answers: Vec<AtomicU64> = queries.iter().map(|_| AtomicU64::new(0)).collect();
     let todo = AtomicUsize::new(0);
+    let wide = std::sync::Mutex::new(Vec::new());
     thread::scope(|s| {
         for _ in 0..k.min(queries.len()) {
             s.spawn(|| {
-                let (mut dist, mut seen) = (vec![u64::MAX; n], Vec::new());
+                // Distances fit in 32 bits except near the few edges of weight about 2^32; only
+                // those searches are redone, one at a time, over a shared 64-bit table.
+                let (mut dist, mut seen) = (vec![u32::MAX; n], Vec::new());
                 loop {
                     let j = todo.fetch_add(1, Relaxed);
                     let Some(&(src, t)) = queries.get(j) else { break };
+                    let (s, t2) = (new[src] as usize, new[t] as usize);
                     let d = if src == t {
                         0
                     } else if has_in[t / 64].load(Relaxed) >> (t % 64) & 1 == 0 {
                         -1
+                    } else if let Some(d) = search(&off, &adj, &mut dist, u32::MAX, &mut seen, s, t2) {
+                        d
                     } else {
-                        search(&off, &adj, &mut dist, &mut seen, new[src] as usize, new[t] as usize)
+                        let mut wide = wide.lock().unwrap();
+                        if wide.is_empty() {
+                            *wide = vec![u64::MAX; n];
+                        }
+                        search(&off, &adj, &mut wide, u64::MAX, &mut seen, s, t2).unwrap()
                     };
                     answers[j].store(d as u64, Relaxed);
                 }
