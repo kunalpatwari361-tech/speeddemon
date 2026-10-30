@@ -100,24 +100,21 @@ fn main() {
     let b = map("/data/records.csv");
     let slots: Vec<AtomicU64> = (0..1usize << SLOT_BITS).map(|_| AtomicU64::new(0)).collect();
     let seen: Vec<AtomicU64> = (0..(unmatched + 1) << (SLOT_BITS - 6)).map(|_| AtomicU64::new(0)).collect();
+    // A slot holds a name's 64-bit hash, which identifies it among the 100,000 (a collision is
+    // about 1 in 4 billion).
     let slot_of = |at: usize, len: usize| {
-        let key = &b[at..at + len];
-        let hash = key.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &c| (h ^ c as u64).wrapping_mul(0x100_0000_01b3));
+        let hash = b[at..at + len].iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &c| (h ^ c as u64).wrapping_mul(0x100_0000_01b3)) | 1;
         let mut s = (hash.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - SLOT_BITS)) as usize;
-        let mine = (at as u64 + 1) << 24 | len as u64;
-        let same = |v: u64| v & 0xff_ffff == len as u64 && &b[(v >> 24) as usize - 1..][..len] == key;
         loop {
-            let v = slots[s].load(Relaxed);
-            if v == 0 {
-                match slots[s].compare_exchange(0, mine, Relaxed, Relaxed) {
+            match slots[s].load(Relaxed) {
+                v if v == hash => return s,
+                0 => match slots[s].compare_exchange(0, hash, Relaxed, Relaxed) {
                     Ok(_) => return s,
-                    Err(v) if same(v) => return s,
+                    Err(v) if v == hash => return s,
                     Err(_) => {}
-                }
-            } else if same(v) {
-                return s;
+                },
+                _ => s = (s + 1) & ((1 << SLOT_BITS) - 1),
             }
-            s = (s + 1) & ((1 << SLOT_BITS) - 1);
         }
     };
 
