@@ -94,26 +94,28 @@ fn main() {
     let (n, m) = (num(g, &mut i) as usize, num(g, &mut i) as usize);
     let k = thread::available_parallelism().map_or(1, |x| x.get());
     let parts = cuts(g, i, k);
-    let edges = |f: &(dyn Fn(usize, u64, u64) + Sync)| {
-        thread::scope(|s| {
-            for w in parts.windows(2) {
-                s.spawn(move || {
-                    let mut i = w[0];
-                    while i < w[1] {
-                        let (u, v, c) = (num(g, &mut i), num(g, &mut i), num(g, &mut i));
-                        f(u as usize, v, c);
-                    }
-                });
-            }
-        })
-    };
-
-    // Compressed adjacency: count out-degrees and mark nodes with in-edges, then place every edge.
+    // Compressed adjacency: parse each part once into edge triples, counting out-degrees and
+    // marking nodes with in-edges, then place every edge from the triples.
     let deg: Vec<AtomicU32> = (0..=n).map(|_| AtomicU32::new(0)).collect();
     let has_in: Vec<AtomicU64> = (0..n / 64 + 1).map(|_| AtomicU64::new(0)).collect();
-    edges(&|u, v, _| {
-        deg[u + 1].fetch_add(1, Relaxed);
-        has_in[v as usize / 64].fetch_or(1 << (v % 64), Relaxed);
+    let lists: Vec<Vec<[u32; 3]>> = thread::scope(|s| {
+        let hs: Vec<_> = parts
+            .windows(2)
+            .map(|w| {
+                let (deg, has_in) = (&deg, &has_in);
+                s.spawn(move || {
+                    let (mut i, mut list) = (w[0], Vec::with_capacity((w[1] - w[0]) / 16));
+                    while i < w[1] {
+                        let e = [num(g, &mut i) as u32, num(g, &mut i) as u32, num(g, &mut i) as u32];
+                        deg[e[0] as usize + 1].fetch_add(1, Relaxed);
+                        has_in[e[1] as usize / 64].fetch_or(1 << (e[1] % 64), Relaxed);
+                        list.push(e);
+                    }
+                    list
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let mut off: Vec<u32> = deg.into_iter().map(AtomicU32::into_inner).collect();
     for j in 1..=n {
@@ -121,7 +123,16 @@ fn main() {
     }
     let next: Vec<AtomicU32> = off[..n].iter().map(|&o| AtomicU32::new(o)).collect();
     let adj: Vec<AtomicU64> = (0..m).map(|_| AtomicU64::new(0)).collect();
-    edges(&|u, v, c| adj[next[u].fetch_add(1, Relaxed) as usize].store(v << 32 | c, Relaxed));
+    thread::scope(|s| {
+        for list in lists {
+            let (next, adj) = (&next, &adj);
+            s.spawn(move || {
+                for [u, v, c] in list {
+                    adj[next[u as usize].fetch_add(1, Relaxed) as usize].store((v as u64) << 32 | c as u64, Relaxed);
+                }
+            });
+        }
+    });
     drop(next);
     let adj: Vec<u64> = adj.into_iter().map(AtomicU64::into_inner).collect();
 

@@ -6,7 +6,7 @@ The task, the input files and the exact output format are in the [spec](https://
 
 Rust, standard library only. Both input files are memory-mapped; `/data` is already in the page cache, so reading costs no copy and no memory.
 
-The graph is parsed on every hardware thread twice: once to count out-degrees (and mark which nodes have an in-edge), and once to place each edge into a compressed adjacency array, with an atomic cursor per node. Each edge is packed as head and weight in one 64-bit word.
+The graph is parsed once on every hardware thread into compact edge triples, counting out-degrees and marking which nodes have an in-edge as it goes. The triples are then placed into a compressed adjacency array, with an atomic cursor per node. Each edge is packed as head and weight in one 64-bit word.
 
 Node ids are a random relabelling, so a search would jump all over memory. Before querying, the nodes are renumbered: one breadth-first search per thread grows a region from its own root, claiming unclaimed nodes, and each region gets a contiguous id range. Neighbours end up with nearby ids, and a search stays in cache.
 
