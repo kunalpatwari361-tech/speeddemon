@@ -14,7 +14,7 @@ The file is parsed once. Each thread counts its requests per group and keeps a c
 
 Endpoints are sorted by byte. Hours are split across threads, and each formats its hours' lines in order, sorting each group's run once to read the nearest-rank percentiles. The buffers are written in order.
 
-The build is profile-guided: an instrumented binary runs on sample data made by the published generator (`generate.py`, an unmodified copy), and the release binary is rebuilt from that profile for the scoring CPU.
+The binary is built for the scoring CPU (`target-cpu=native`).
 
 ## Dependencies
 

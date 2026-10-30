@@ -16,7 +16,7 @@ The corpus is split into one part per hardware thread, each starting at a docume
 
 A `BOOL` query is evaluated left to right. The result stays a sorted list of ids while it can: AND and NOT filter it, and an OR with another list merges into it. It moves to a bitset only to load or OR in a common term. A `PHRASE` of two terms is exactly the documents holding that adjacent pair. A longer phrase starts from the documents holding all of its pairs, which are very few, and checks each one's tokens for the whole sequence.
 
-The build is profile-guided: an instrumented binary runs on sample data made by the published generator (`generate.py`, an unmodified copy), and the release binary is rebuilt from that profile for the scoring CPU.
+The binary is built for the scoring CPU (`target-cpu=native`).
 
 ## Dependencies
 

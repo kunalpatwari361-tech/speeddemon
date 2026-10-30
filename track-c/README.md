@@ -12,7 +12,7 @@ Rust, standard library only. Both files are memory-mapped; `/data` is already in
 
 Distinct names are counted without storing any strings. Every name gets a slot in one lock-free open-addressing table shared by all threads, keyed by a 64-bit hash of the name's raw bytes. The raw bytes identify the value because escaping is one to one, and among 100,000 names a 64-bit collision is about 1 in 4 billion. Each country has a bitset over those slots, and its distinct count is the bitset's population count.
 
-The build is profile-guided: an instrumented binary runs on sample data made by the published generator (`generate.py`, an unmodified copy), and the release binary is rebuilt from that profile for the scoring CPU.
+The binary is built for the scoring CPU (`target-cpu=native`).
 
 ## Dependencies
 
