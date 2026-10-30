@@ -80,13 +80,14 @@ impl Endpoints<'_> {
 
     /// Calls f(group, latency, is_5xx) for every line in b[from..to]; group = slot * HOURS + hour.
     fn each(&self, from: usize, to: usize, base: u64, mut f: impl FnMut(usize, u32, bool)) {
-        let (b, mut i, mut date, mut today) = (self.b, from, [0u8; 10], 0);
+        // Bytes 5..13 of a timestamp are "MM-DDTHH": one word that changes only with the hour.
+        let (b, mut i, mut stamp, mut h) = (self.b, from, 0, 0);
         while i < to {
-            if b[i..i + 10] != date {
-                date.copy_from_slice(&b[i..i + 10]);
-                today = day(&date) * 24 - base;
+            let w = u64::from_le_bytes(b[i + 5..i + 13].try_into().unwrap());
+            if w != stamp {
+                stamp = w;
+                h = (day(&b[i..]) * 24 + num(&b[i + 11..i + 13]) - base) as usize;
             }
-            let h = (today + num(&b[i + 11..i + 13])) as usize;
             let mut j = i + 28;
             while b[j] != b' ' {
                 j += 1;
