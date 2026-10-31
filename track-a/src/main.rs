@@ -1,4 +1,3 @@
-use std::ffi::c_void;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -8,7 +7,7 @@ use std::thread;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
-    fn free(p: *mut c_void);
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 
 // The line scanner, in C++ (native/scan.cpp), built into native/libscan.a by the Dockerfile.
@@ -22,12 +21,13 @@ extern "C" {
         keys: *mut u64,
         spans: *mut u64,
         streams: *mut Stream,
+        arena: *mut Chunk,
     );
 }
 
 const HOURS: usize = 72; // the span is fixed: 2026-10-30T18:00Z to 2026-11-02T18:00Z
 const SLOTS: usize = 4096; // the endpoint catalogue is 1,842 templates
-const CHUNK: usize = 256; // records per chunk, as in scan.cpp
+const CHUNK: usize = 680; // records per chunk, as in scan.cpp: a chunk is one 4 KB page
 const ERROR: u16 = 0x8000; // set in a record's slot for a 5xx status
 
 /// One part's records for one hour, as a linked list of chunks. Matches scan.cpp.
@@ -51,6 +51,9 @@ struct Chunk {
     lat: [u32; CHUNK],
     slot: [u16; CHUNK],
 }
+const PAGE: usize = 4096;
+const _: () = assert!(std::mem::size_of::<Chunk>() == PAGE);
+const MADV_DONTNEED: i32 = 4;
 
 /// The whole file, read-only. /data is already in the page cache, so this costs no memory.
 fn map(path: &str) -> &'static [u8] {
@@ -135,15 +138,20 @@ fn push_num(out: &mut Vec<u8>, mut v: usize) {
     out.extend_from_slice(&digits[i..]);
 }
 
-/// Frees one hour's chunks in every part.
+/// Gives one hour's chunk pages in every part back to the system, a run of adjacent pages at a time.
 fn free_hour(parts: &[[Stream; HOURS]], h: usize) {
     for p in parts {
-        let mut c = p[h].head;
+        let (mut c, mut run) = (p[h].head, (ptr::null_mut::<Chunk>(), 0));
         while !c.is_null() {
             let next = unsafe { (*c).next };
-            unsafe { free(c.cast()) };
+            if run.0.wrapping_add(run.1) != c {
+                unsafe { madvise(run.0.cast(), run.1 * PAGE, MADV_DONTNEED) };
+                run = (c, 0);
+            }
+            run.1 += 1;
             c = next;
         }
+        unsafe { madvise(run.0.cast(), run.1 * PAGE, MADV_DONTNEED) };
     }
 }
 
@@ -166,7 +174,8 @@ fn main() {
     cut.push(b.len());
 
     // The file is scanned once, in C++: each part appends its lines to its hours' streams. Lines are not in
-    // time order, so an hour's records come from every part.
+    // time order, so an hour's records come from every part. A part's chunks are the pages of its own arena,
+    // sized for its most lines (a line is at least 40 bytes) plus a partly filled chunk per hour.
     let parts: Vec<[Stream; HOURS]> = thread::scope(|s| {
         let hs: Vec<_> = cut
             .windows(2)
@@ -177,6 +186,8 @@ fn main() {
                         head: ptr::null_mut(),
                         tail: ptr::null_mut(),
                     }; HOURS];
+                    let pages = (w[1] - w[0]) / 40 / CHUNK + HOURS + 1;
+                    let arena = unsafe { mmap(ptr::null_mut(), pages * PAGE, 3, 0x22, -1, 0) };
                     unsafe {
                         scan_part(
                             b.as_ptr(),
@@ -186,6 +197,7 @@ fn main() {
                             keys.as_ptr() as *mut u64,
                             spans.as_ptr() as *mut u64,
                             streams.as_mut_ptr(),
+                            arena.cast(),
                         )
                     };
                     streams

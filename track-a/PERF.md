@@ -23,4 +23,12 @@ The laptop cannot resolve effects under about 5%. The same binary's paired media
 | Dynamic split: four parts per thread, taken from a shared counter | parse (harness) | 10 rounds: 25.2 to 23.1 ms median; best 15.0 to 15.7 ms | Not kept: best times mixed; the board has no efficiency cores |
 | Ablations: no digit arithmetic, no hash mixing, no endpoint table, no endpoint loop | parse (harness) | each within the run-to-run spread | Diagnostic only |
 
+Later experiments, each run interleaved against the build before it:
+
+| Experiment | Where | Paired result | Decision |
+|---|---|---|---|
+| Nested selection: p50 in the whole run, p95 among the values above it, p99 among those above p95 | hour phase | 12 rounds against step 2: 76 to 67 ms median, faster 6/12; the percentile step's own CPU time, 5 runs each: 72 to 78 ms sorting, 53 to 65 ms selecting | Kept: about a quarter less work; the whole-run effect is below the laptop's resolution |
+| Chunks are 4 KB pages of 680 records from one arena per part; a finished hour's pages go back with madvise, adjacent pages in one call | memory | 12 rounds: 84 to 70 ms median, faster 10/12; peak 33 to 35 MB before, 24 to 25 MB after, in every round | Kept: glibc kept freed chunks, so the 10 MB output was added on top of them |
+| Endpoint lookup cost: full lookup, hashing without the table, a byte search for the endpoint's end | parse | scan 29 to 46, 24 to 50 and 31 to 63 ms over 6 runs each | Diagnostic: the lookup costs nothing measurable, so it is unchanged |
+
 The parse is about 60% of a laptop run. A bare newline count over the same bytes takes 7 to 8 ms, and the scan runs at two to three times that. Track A commits between rows 1 and 2 (0bcc05e, 5fbde5e, 695f577) have no rows: their board runs are no longer in the board data.

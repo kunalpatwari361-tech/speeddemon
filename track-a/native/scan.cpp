@@ -4,14 +4,13 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 
 namespace {
 
 constexpr size_t HOURS = 72;
 constexpr size_t SLOTS = 4096;
-constexpr uint32_t CHUNK = 256;  // records per chunk
+constexpr uint32_t CHUNK = 680;  // records per chunk, so a chunk fills one 4 KB page
 constexpr uint64_t K = 0x9e3779b97f4a7c15ull;
 
 uint64_t load64(const uint8_t* p) {
@@ -110,6 +109,7 @@ struct Chunk {
     uint32_t lat[CHUNK];
     uint16_t slot[CHUNK];  // the endpoint's slot, with 0x8000 set for a 5xx
 };
+static_assert(sizeof(Chunk) == 4096, "a chunk is one page");
 
 struct Stream {
     Chunk* head;
@@ -118,9 +118,10 @@ struct Stream {
 
 namespace {
 
-void append(Stream& s, uint32_t lat, uint16_t slot) {
+// A new chunk is the next page of the part's arena.
+void append(Stream& s, Chunk*& arena, uint32_t lat, uint16_t slot) {
     if (!s.tail || s.tail->n == CHUNK) {
-        Chunk* c = static_cast<Chunk*>(std::malloc(sizeof(Chunk)));
+        Chunk* c = arena++;
         c->next = nullptr;
         c->n = 0;
         if (s.tail) s.tail->next = c; else s.head = c;
@@ -135,9 +136,9 @@ void append(Stream& s, uint32_t lat, uint16_t slot) {
 extern "C" {
 
 void scan_part(const uint8_t* b, size_t from, size_t to, uint64_t base, std::atomic<uint64_t>* keys,
-               std::atomic<uint64_t>* spans, Stream* streams) {
+               std::atomic<uint64_t>* spans, Stream* streams, Chunk* arena) {
     scan(b, from, to, base, keys, spans, [&](size_t h, size_t s, uint32_t lat, bool error) {
-        append(streams[h], lat, static_cast<uint16_t>(s | (error ? 0x8000 : 0)));
+        append(streams[h], arena, lat, static_cast<uint16_t>(s | (error ? 0x8000 : 0)));
     });
 }
 

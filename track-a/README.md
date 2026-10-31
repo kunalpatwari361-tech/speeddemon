@@ -10,9 +10,9 @@ The file is split into one part per hardware thread, at line boundaries. Each li
 
 Endpoints are interned into one lock-free open-addressing table shared by all threads. A slot holds where the endpoint first occurs in the file, so no string is ever copied. A group is (endpoint slot, hour), and the span is fixed at 72 hours.
 
-The file is scanned once. Each line becomes one 6-byte record, its latency and its endpoint's slot with a bit for 5xx, appended to the chunk list of its hour in its part. A chunk holds 256 records, so a part's records for an hour are never copied or reallocated.
+The file is scanned once. Each line becomes one 6-byte record, its latency and its endpoint's slot with a bit for 5xx, appended to the chunk list of its hour in its part. A chunk is one 4 KB page of 680 records, the next page of its part's own arena, so a part's records for an hour are never copied or reallocated, and no allocator is involved.
 
-Endpoints are sorted by byte. Hours are then processed in parallel, in any order, since the log is not in time order. For an hour, one pass over its records counts each endpoint's requests and 5xx responses, and a second pass places each latency in its endpoint's run of one buffer that stays in cache. Each run is sorted once to read the nearest-rank percentiles. The hours' lines are written in hour order as they finish, and an hour's chunks are freed when it is done.
+Endpoints are sorted by byte. Hours are then processed in parallel, in any order, since the log is not in time order. For an hour, one pass over its records counts each endpoint's requests and 5xx responses, and a second pass places each latency in its endpoint's run of one buffer that stays in cache. The nearest-rank percentiles are selected, not sorted: p50 in the whole run, then p95 among the values above it, and p99 among those above p95. The hours' lines are written in hour order as they finish, and an hour's chunk pages go back to the system when it is done, adjacent pages in one call, so the output written to `/out` reuses that memory.
 
 The binary is built for the scoring CPU (`target-cpu=native`).
 
