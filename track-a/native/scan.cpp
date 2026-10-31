@@ -10,7 +10,7 @@ namespace {
 
 constexpr size_t HOURS = 72;
 constexpr size_t SLOTS = 4096;
-constexpr uint32_t CHUNK = 680;  // records per chunk, so a chunk fills one 4 KB page
+constexpr uint32_t CHUNK = 1020;  // records per chunk, so a chunk fills one 4 KB page
 constexpr uint64_t K = 0x9e3779b97f4a7c15ull;
 
 uint64_t load64(const uint8_t* p) {
@@ -102,12 +102,13 @@ void scan(const uint8_t* b, size_t from, size_t to, uint64_t base, std::atomic<u
 
 }  // namespace
 
-// One part's records for one hour: a linked list of chunks, in arrival order.
+// One part's records for one hour: a linked list of chunks, in arrival order. A record is the endpoint's
+// slot << 20 | 5xx << 19 | overflow << 18 | 18 bits: the latency, or for a latency of 2^18 or more (about
+// one line in twenty) its index in the part's overflow list.
 struct Chunk {
     Chunk* next;
     uint32_t n;
-    uint32_t lat[CHUNK];
-    uint16_t slot[CHUNK];  // the endpoint's slot, with 0x8000 set for a 5xx
+    uint32_t rec[CHUNK];
 };
 static_assert(sizeof(Chunk) == 4096, "a chunk is one page");
 
@@ -119,7 +120,7 @@ struct Stream {
 namespace {
 
 // A new chunk is the next page of the part's arena.
-void append(Stream& s, Chunk*& arena, uint32_t lat, uint16_t slot) {
+void append(Stream& s, Chunk*& arena, uint32_t rec) {
     if (!s.tail || s.tail->n == CHUNK) {
         Chunk* c = arena++;
         c->next = nullptr;
@@ -127,19 +128,26 @@ void append(Stream& s, Chunk*& arena, uint32_t lat, uint16_t slot) {
         if (s.tail) s.tail->next = c; else s.head = c;
         s.tail = c;
     }
-    s.tail->lat[s.tail->n] = lat;
-    s.tail->slot[s.tail->n++] = slot;
+    s.tail->rec[s.tail->n++] = rec;
 }
 
 }  // namespace
 
 extern "C" {
 
-void scan_part(const uint8_t* b, size_t from, size_t to, uint64_t base, std::atomic<uint64_t>* keys,
-               std::atomic<uint64_t>* spans, Stream* streams, Chunk* arena) {
+// Returns how many latencies went to the overflow list.
+uint32_t scan_part(const uint8_t* b, size_t from, size_t to, uint64_t base, std::atomic<uint64_t>* keys,
+                   std::atomic<uint64_t>* spans, Stream* streams, Chunk* arena, uint32_t* overflow) {
+    uint32_t spilled = 0;
     scan(b, from, to, base, keys, spans, [&](size_t h, size_t s, uint32_t lat, bool error) {
-        append(streams[h], arena, lat, static_cast<uint16_t>(s | (error ? 0x8000 : 0)));
+        uint32_t v = lat;
+        if (lat >= 1u << 18) {
+            overflow[spilled] = lat;
+            v = 1u << 18 | spilled++;
+        }
+        append(streams[h], arena, static_cast<uint32_t>(s) << 20 | (error ? 1u << 19 : 0) | v);
     });
+    return spilled;
 }
 
 }  // extern "C"

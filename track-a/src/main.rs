@@ -22,13 +22,14 @@ extern "C" {
         spans: *mut u64,
         streams: *mut Stream,
         arena: *mut Chunk,
-    );
+        overflow: *mut u32,
+    ) -> u32;
 }
 
 const HOURS: usize = 72; // the span is fixed: 2026-10-30T18:00Z to 2026-11-02T18:00Z
 const SLOTS: usize = 4096; // the endpoint catalogue is 1,842 templates
-const CHUNK: usize = 680; // records per chunk, as in scan.cpp: a chunk is one 4 KB page
-const ERROR: u16 = 0x8000; // set in a record's slot for a 5xx status
+const CHUNK: usize = 1020; // records per chunk, as in scan.cpp: a chunk is one 4 KB page
+const WIDE: u32 = 1 << 18; // a latency this large or larger is kept in the part's overflow list
 
 /// One part's records for one hour, as a linked list of chunks. Matches scan.cpp.
 #[repr(C)]
@@ -43,14 +44,17 @@ struct Stream {
 unsafe impl Send for Stream {}
 unsafe impl Sync for Stream {}
 
-/// Up to CHUNK records of one stream, in arrival order.
+/// Up to CHUNK records of one stream, in arrival order. A record is the endpoint's slot << 20 | 5xx << 19 |
+/// overflow << 18 | 18 bits: the latency, or the index of a latency of WIDE or more in the overflow list.
 #[repr(C)]
 struct Chunk {
     next: *mut Chunk,
     n: u32,
-    lat: [u32; CHUNK],
-    slot: [u16; CHUNK],
+    rec: [u32; CHUNK],
 }
+
+/// One part's streams, one per hour, and its overflow list.
+type Part = ([Stream; HOURS], Vec<u32>);
 const PAGE: usize = 4096;
 const _: () = assert!(std::mem::size_of::<Chunk>() == PAGE);
 const MADV_DONTNEED: i32 = 4;
@@ -95,16 +99,13 @@ fn hour_text(hour: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{:02}:00:00Z", hour % 24)
 }
 
-/// Calls f(slot, latency) for every record of hour h, part by part. A 5xx record has ERROR set in its slot.
-fn records(parts: &[[Stream; HOURS]], h: usize, mut f: impl FnMut(u16, u32)) {
-    for p in parts {
-        let mut c = p[h].head;
+/// Calls f(record, overflow list) for every record of hour h, part by part.
+fn records(parts: &[Part], h: usize, mut f: impl FnMut(u32, &[u32])) {
+    for (streams, overflow) in parts {
+        let mut c = streams[h].head;
         while !c.is_null() {
             let ch = unsafe { &*c };
-            let n = ch.n as usize;
-            for (&s, &l) in ch.slot[..n].iter().zip(&ch.lat[..n]) {
-                f(s, l);
-            }
+            ch.rec[..ch.n as usize].iter().for_each(|&r| f(r, overflow));
             c = ch.next;
         }
     }
@@ -140,9 +141,9 @@ fn push_num(out: &mut Vec<u8>, mut v: usize) {
 }
 
 /// Gives one hour's chunk pages in every part back to the system, a run of adjacent pages at a time.
-fn free_hour(parts: &[[Stream; HOURS]], h: usize) {
-    for p in parts {
-        let (mut c, mut run) = (p[h].head, (ptr::null_mut::<Chunk>(), 0));
+fn free_hour(parts: &[Part], h: usize) {
+    for (streams, _) in parts {
+        let (mut c, mut run) = (streams[h].head, (ptr::null_mut::<Chunk>(), 0));
         while !c.is_null() {
             let next = unsafe { (*c).next };
             if run.0.wrapping_add(run.1) != c {
@@ -179,7 +180,7 @@ fn main() {
     // sized for its most lines (a line is at least 40 bytes) plus a partly filled chunk per hour. The arena
     // refuses huge pages: one 2 MB page would hold many hours' chunks, and giving back 4 KB of it would
     // only split it later, so a finished hour would stay counted.
-    let parts: Vec<[Stream; HOURS]> = thread::scope(|s| {
+    let parts: Vec<Part> = thread::scope(|s| {
         let hs: Vec<_> = cut
             .windows(2)
             .map(|w| {
@@ -192,7 +193,8 @@ fn main() {
                     let pages = (w[1] - w[0]) / 40 / CHUNK + HOURS + 1;
                     let arena = unsafe { mmap(ptr::null_mut(), pages * PAGE, 3, 0x22, -1, 0) };
                     unsafe { madvise(arena, pages * PAGE, MADV_NOHUGEPAGE) };
-                    unsafe {
+                    let mut overflow = Vec::with_capacity((w[1] - w[0]) / 40);
+                    let spilled = unsafe {
                         scan_part(
                             b.as_ptr(),
                             w[0],
@@ -202,9 +204,11 @@ fn main() {
                             spans.as_ptr() as *mut u64,
                             streams.as_mut_ptr(),
                             arena.cast(),
+                            overflow.as_mut_ptr(),
                         )
                     };
-                    streams
+                    unsafe { overflow.set_len(spilled as usize) };
+                    (streams, overflow)
                 })
             })
             .collect();
@@ -243,10 +247,9 @@ fn main() {
                     }
                     count.fill(0);
                     errors.fill(0);
-                    records(parts, h, |s, _| {
-                        let slot = (s & !ERROR) as usize;
-                        count[slot] += 1;
-                        errors[slot] += ((s & ERROR) != 0) as u32;
+                    records(parts, h, |r, _| {
+                        count[(r >> 20) as usize] += 1;
+                        errors[(r >> 20) as usize] += r >> 19 & 1;
                     });
                     let mut total = 0;
                     for &(_, s) in eps {
@@ -254,9 +257,9 @@ fn main() {
                         total += count[s] as usize;
                     }
                     lat.resize(total, 0);
-                    records(parts, h, |s, l| {
-                        let s = (s & !ERROR) as usize;
-                        lat[at[s]] = l;
+                    records(parts, h, |r, overflow| {
+                        let (s, v) = ((r >> 20) as usize, r & (WIDE - 1));
+                        lat[at[s]] = if r & WIDE != 0 { overflow[v as usize] } else { v };
                         at[s] += 1;
                     });
                     free_hour(parts, h);

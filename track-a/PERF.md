@@ -36,3 +36,5 @@ Later experiments, each run interleaved against the build before it:
 The parse is about 60% of a laptop run. A bare newline count over the same bytes takes 7 to 8 ms, and the scan runs at two to three times that. Track A commits between rows 1 and 2 (0bcc05e, 5fbde5e, 695f577) have no rows: their board runs are no longer in the board data.
 
 Memory, later: an hour's chunk pages go back as soon as its latencies are placed, before its lines are formatted, so they no longer overlap the 12 threads' hour buffers. Laptop, 8 runs each: peak 25.7 to 27.1 MB before (median about 26.1), 23.0 to 24.4 MB after in 7 of 8 runs (median about 23.7); time unchanged.
+
+Memory, later: a record is one 32-bit word, the endpoint's slot (12 bits), a 5xx bit, an overflow bit and 18 bits holding the latency, or for a latency of 2^18 or more its index in the part's overflow list (5.4% of lines at full scale), so a chunk page holds 1,020 records instead of 680. Laptop, 12 paired runs: peak 22 to 26 MB before, 19 to 22 MB after, lower in every run; median 42 to 45 ms, faster in 6/12 (the first rounds noisy, the last six all faster), so no clear change in time.
