@@ -1,11 +1,12 @@
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 
 /// The whole file, read-only. /data is already in the page cache, so this costs no memory.
@@ -25,6 +26,8 @@ fn zeroed(n: usize) -> Vec<AtomicU32> {
 
 const HOURS: usize = 72; // the span is fixed: 2026-10-30T18:00Z to 2026-11-02T18:00Z
 const SLOTS: usize = 4096; // the endpoint catalogue is 1,842 templates
+const PAGE: usize = 4096;
+const MADV_DONTNEED: i32 = 4;
 
 fn num(b: &[u8]) -> u64 {
     b.iter().fold(0, |v, &c| v * 10 + (c - b'0') as u64)
@@ -133,33 +136,27 @@ fn main() {
     let mut cut: Vec<usize> = (0..k).map(|j| b.len() * j / k).map(|p| if p == 0 { 0 } else { next(p) }).collect();
     cut.push(b.len());
 
-    // One parse: each thread counts its requests per group (a group has far fewer than 65,536)
-    // and keeps (group, latency) per line, in chunks that are freed as soon as they are placed;
-    // 5xx per group are counted in one shared table, since they are rare.
-    const CHUNK: usize = 1 << 16;
+    // Pass 1: each thread counts its requests per group, so every thread's offset in each group's run
+    // is known before any latency is stored. 5xx responses go to one shared table, since they are rare.
     let errors: Vec<AtomicU32> = zeroed(SLOTS * HOURS);
-    let (counts, records): (Vec<Vec<u16>>, Vec<Vec<Vec<u64>>>) = thread::scope(|s| {
+    let counts: Vec<Vec<u16>> = thread::scope(|s| {
         let hs: Vec<_> = cut
             .windows(2)
             .map(|w| {
                 let (ep, errors) = (&ep, &errors);
                 s.spawn(move || {
-                    let (mut count, mut records) = (vec![0u16; SLOTS * HOURS], vec![Vec::with_capacity(CHUNK)]);
-                    ep.each(w[0], w[1], base, |g, l, error| {
+                    let mut count = vec![0u16; SLOTS * HOURS];
+                    ep.each(w[0], w[1], base, |g, _, error| {
                         count[g] += 1;
-                        if records.last().unwrap().len() == CHUNK {
-                            records.push(Vec::with_capacity(CHUNK));
-                        }
-                        records.last_mut().unwrap().push((g as u64) << 32 | l as u64);
                         if error {
                             errors[g].fetch_add(1, Relaxed);
                         }
                     });
-                    (count, records)
+                    count
                 })
             })
             .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).unzip()
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
     // Endpoints in byte order.
@@ -189,54 +186,72 @@ fn main() {
         (start[g], end[g], at) = (at, at + end[g], at + end[g]);
     }
     let lat = zeroed(at as usize);
+
+    // Pass 2: the same parse again, storing each latency at its group's run, at the thread's cursor.
     thread::scope(|s| {
-        for (mut cur, records) in cursors.into_iter().zip(records) {
-            let (lat, start) = (&lat, &start);
+        for (mut cur, w) in cursors.into_iter().zip(cut.windows(2)) {
+            let (ep, lat, start) = (&ep, &lat, &start);
             s.spawn(move || {
-                for chunk in records {
-                    for r in chunk {
-                        let g = (r >> 32) as usize;
-                        lat[(start[g] + cur[g] as u32) as usize].store(r as u32, Relaxed);
-                        cur[g] += 1;
-                    }
-                }
+                ep.each(w[0], w[1], base, |g, l, _| {
+                    lat[(start[g] + cur[g] as u32) as usize].store(l, Relaxed);
+                    cur[g] += 1;
+                });
             });
         }
     });
 
-    // Hours split across threads, each formatting its lines.
-    let outs: Vec<Vec<u8>> = thread::scope(|s| {
-        let hs: Vec<_> = (0..k)
-            .map(|j| {
-                let (eps, start, end, lat, errors) = (&eps, &start, &end, &lat, &errors);
-                s.spawn(move || {
-                    let (mut out, mut v) = (Vec::new(), Vec::new());
-                    for h in HOURS * j / k..HOURS * (j + 1) / k {
-                        let text = hour_text(base + h as u64);
-                        for &(name, slot) in eps {
-                            let g = slot * HOURS + h;
-                            let (from, to) = (start[g] as usize, end[g] as usize);
-                            let n = to - from;
-                            if n == 0 {
-                                continue;
-                            }
-                            v.clear();
-                            v.extend(lat[from..to].iter().map(|x| x.load(Relaxed)));
-                            v.sort_unstable();
-                            let pct = |p: usize| v[(p * n + 99) / 100 - 1];
-                            let e = errors[g].load(Relaxed) as usize;
-                            out.extend_from_slice(text.as_bytes());
-                            out.push(b' ');
-                            out.extend_from_slice(name);
-                            writeln!(out, " {n} {} {} {} {e} {}", pct(50), pct(95), pct(99), e * 1_000_000 / n).unwrap();
-                        }
-                    }
-                    out
-                })
-            })
-            .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+    // Hours go to whichever thread is free, and are written in hour order as they finish. An hour's
+    // runs are contiguous in lat, so once it is formatted its whole pages go back to the system.
     let mut file = File::create("/out/summary.txt").unwrap();
-    outs.into_iter().for_each(|o| file.write_all(&o).unwrap());
+    let next_hour = AtomicUsize::new(0);
+    thread::scope(|s| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..k {
+            let (tx, eps, start, end, lat, errors, next_hour) = (tx.clone(), &eps, &start, &end, &lat, &errors, &next_hour);
+            s.spawn(move || {
+                let (mut v, lat_addr) = (Vec::new(), lat.as_ptr() as usize);
+                loop {
+                    let h = next_hour.fetch_add(1, Relaxed);
+                    if h >= HOURS {
+                        break;
+                    }
+                    let (text, mut out) = (hour_text(base + h as u64), Vec::new());
+                    for &(name, slot) in eps {
+                        let g = slot * HOURS + h;
+                        let (from, to) = (start[g] as usize, end[g] as usize);
+                        let n = to - from;
+                        if n == 0 {
+                            continue;
+                        }
+                        v.clear();
+                        v.extend(lat[from..to].iter().map(|x| x.load(Relaxed)));
+                        v.sort_unstable();
+                        let pct = |p: usize| v[(p * n + 99) / 100 - 1];
+                        let e = errors[g].load(Relaxed) as usize;
+                        out.extend_from_slice(text.as_bytes());
+                        out.push(b' ');
+                        out.extend_from_slice(name);
+                        writeln!(out, " {n} {} {} {} {e} {}", pct(50), pct(95), pct(99), e * 1_000_000 / n).unwrap();
+                    }
+                    let (first, last) = (eps[0].1 * HOURS + h, eps[eps.len() - 1].1 * HOURS + h);
+                    let (lo, hi) = (lat_addr + start[first] as usize * 4, lat_addr + end[last] as usize * 4);
+                    let (from, to) = ((lo + PAGE - 1) & !(PAGE - 1), hi & !(PAGE - 1));
+                    if to > from {
+                        unsafe { madvise(from as *mut u8, to - from, MADV_DONTNEED) };
+                    }
+                    tx.send((h, out)).unwrap();
+                }
+            });
+        }
+        drop(tx);
+        let mut pending: Vec<Option<Vec<u8>>> = vec![None; HOURS];
+        let mut written = 0;
+        for (h, out) in rx {
+            pending[h] = Some(out);
+            while let Some(out) = pending.get_mut(written).and_then(Option::take) {
+                file.write_all(&out).unwrap();
+                written += 1;
+            }
+        }
+    });
 }
