@@ -54,6 +54,7 @@ struct Chunk {
 const PAGE: usize = 4096;
 const _: () = assert!(std::mem::size_of::<Chunk>() == PAGE);
 const MADV_DONTNEED: i32 = 4;
+const MADV_NOHUGEPAGE: i32 = 15;
 
 /// The whole file, read-only. /data is already in the page cache, so this costs no memory.
 fn map(path: &str) -> &'static [u8] {
@@ -175,7 +176,9 @@ fn main() {
 
     // The file is scanned once, in C++: each part appends its lines to its hours' streams. Lines are not in
     // time order, so an hour's records come from every part. A part's chunks are the pages of its own arena,
-    // sized for its most lines (a line is at least 40 bytes) plus a partly filled chunk per hour.
+    // sized for its most lines (a line is at least 40 bytes) plus a partly filled chunk per hour. The arena
+    // refuses huge pages: one 2 MB page would hold many hours' chunks, and giving back 4 KB of it would
+    // only split it later, so a finished hour would stay counted.
     let parts: Vec<[Stream; HOURS]> = thread::scope(|s| {
         let hs: Vec<_> = cut
             .windows(2)
@@ -188,6 +191,7 @@ fn main() {
                     }; HOURS];
                     let pages = (w[1] - w[0]) / 40 / CHUNK + HOURS + 1;
                     let arena = unsafe { mmap(ptr::null_mut(), pages * PAGE, 3, 0x22, -1, 0) };
+                    unsafe { madvise(arena, pages * PAGE, MADV_NOHUGEPAGE) };
                     unsafe {
                         scan_part(
                             b.as_ptr(),
