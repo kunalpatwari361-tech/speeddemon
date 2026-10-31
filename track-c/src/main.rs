@@ -35,38 +35,63 @@ fn num(b: &[u8], i: &mut usize) -> u64 {
     v
 }
 
-/// The first `"` at or after i, 8 bytes at a time: it is the first zero byte of a word xored
-/// with quotes. A record's end follows every quote, so every 8-byte read is in bounds.
-fn quote(b: &[u8], mut i: usize) -> usize {
-    loop {
-        let x = u64::from_le_bytes(b[i..i + 8].try_into().unwrap()) ^ 0x2222_2222_2222_2222;
-        let found = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
-        if found != 0 {
-            return i + found.trailing_zeros() as usize / 8;
-        }
-        i += 8;
+/// Bitmasks of the quotes, and of the commas and LFs, among the 64 bytes of b from i (zeros past
+/// its end), from 32-byte compares. The build targets the scoring CPU, which has AVX2.
+fn masks(b: &[u8], i: usize) -> (u64, u64) {
+    use std::arch::x86_64::*;
+    let mut tail = [0u8; 64];
+    let block = b.get(i..i + 64).unwrap_or_else(|| {
+        tail[..b.len() - i].copy_from_slice(&b[i..]);
+        &tail
+    });
+    unsafe {
+        let half = |k: usize| _mm256_loadu_si256(block.as_ptr().add(32 * k) as *const __m256i);
+        let (lo, hi) = (half(0), half(1));
+        let is = |v: __m256i, c: u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c as i8))) as u32 as u64;
+        let both = |c: u8| is(lo, c) | is(hi, c) << 32;
+        (both(b'"'), both(b',') | both(b'\n'))
     }
 }
 
-/// A text field at b[*i] as (start, raw length, value length); leaves *i past its comma.
-/// The raw bytes of a quoted field identify its value, since escaping is one to one.
-fn field(b: &[u8], i: &mut usize) -> (usize, usize, u64) {
-    let start = *i;
-    if b[start] != b'"' {
-        *i += b[start..].iter().position(|&c| c == b',').unwrap() + 1;
-        return (start, *i - 1 - start, (*i - 1 - start) as u64);
+/// Bit k of the result is the parity of bits 0..=k of x.
+fn prefix_xor(mut x: u64) -> u64 {
+    for s in [1, 2, 4, 8, 16, 32] {
+        x ^= x << s;
     }
-    let (mut j, mut escapes) = (start + 1, 0);
-    loop {
-        j = quote(b, j);
-        if b[j + 1] != b'"' {
-            break;
+    x
+}
+
+/// The 8 bytes of b from i, little-endian, with zeros past its end.
+fn load(b: &[u8], i: usize) -> u64 {
+    match b.get(i..i + 8) {
+        Some(w) => u64::from_le_bytes(w.try_into().unwrap()),
+        None => {
+            let mut w = [0u8; 8];
+            w[..b.len() - i].copy_from_slice(&b[i..]);
+            u64::from_le_bytes(w)
         }
-        escapes += 1;
-        j += 2;
     }
-    *i = j + 2;
-    (start + 1, j - start - 1, (j - start - 1 - escapes) as u64)
+}
+
+/// The number spelled by the n decimal digits at b[at], 1 to 8 of them, all at once: shifted so
+/// zeros lead, then neighbouring digits, pairs and quads are joined in three multiplies.
+fn digits(b: &[u8], at: usize, n: usize) -> u64 {
+    let shift = 64 - 8 * n as u32;
+    let x = (load(b, at) << shift) - (0x3030_3030_3030_3030 << shift);
+    let x = (x * 10 + (x >> 8)) & 0x00ff_00ff_00ff_00ff;
+    let x = (x * 100 + (x >> 16)) & 0x0000_ffff_0000_ffff;
+    (x * 10000 + (x >> 32)) & 0xffff_ffff
+}
+
+/// A text field of len bytes at b[at], holding q quote bytes, as (start, raw length, value length).
+/// A quoted value loses its two quotes and one byte per "" pair; the raw bytes identify the value,
+/// since escaping is one to one.
+fn text(b: &[u8], at: usize, len: usize, q: u32) -> (usize, usize, u64) {
+    if len > 0 && b[at] == b'"' {
+        (at + 1, len - 2, (len - 2) as u64 - (q as u64 - 2) / 2)
+    } else {
+        (at, len, len as u64)
+    }
 }
 
 /// A record starts right after an LF with a digit or a BOM. Inside a quoted note an LF is
@@ -122,7 +147,8 @@ fn main() {
     // A slot holds a name's 64-bit hash, which identifies it among the 100,000 (a collision is
     // about 1 in 4 billion).
     let slot_of = |at: usize, len: usize| {
-        let hash = b[at..at + len].iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &c| (h ^ c as u64).wrapping_mul(0x100_0000_01b3)) | 1;
+        let chunk = |k: usize| load(b, at + k) & ((1u128 << (8 * (len - k).min(8))) - 1) as u64;
+        let hash = (0..len).step_by(8).fold(len as u64, |h, k| (h ^ chunk(k)).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29)) | 1;
         let mut s = (hash.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - SLOT_BITS)) as usize;
         loop {
             match slots[s].load(Relaxed) {
@@ -150,33 +176,57 @@ fn main() {
                 let (group, seen, slot_of) = (&group, &seen, &slot_of);
                 s.spawn(move || {
                     let mut agg = vec![empty; unmatched + 1];
-                    let mut i = w[0];
-                    while i < w[1] {
-                        if b[i] == 0xEF {
-                            i += 3;
+                    // A record's fields end at commas and its LF, the ones outside quotes. In each
+                    // 64-byte block the quote bits, prefix-xored, mark the bytes inside quotes, and
+                    // the quotes counted up to a field's end give its quote count.
+                    let (mut at, mut inside, mut quotes) = (w[0], 0u64, 0u32);
+                    let (mut start, mut field_quotes, mut field) = (w[0] + 3 * (b[w[0]] == 0xEF) as usize, 0, 0);
+                    let (mut id, mut name, mut note_len, mut g) = (0, (0, 0, 0), 0, 0);
+                    while at < w[1] {
+                        let (q, sep) = masks(b, at);
+                        let inq = prefix_xor(q) ^ inside;
+                        inside = 0u64.wrapping_sub(inq >> 63);
+                        let mut ends = sep & !inq;
+                        while ends != 0 {
+                            let p = at + ends.trailing_zeros() as usize;
+                            if p >= w[1] {
+                                break;
+                            }
+                            let before = quotes + (q & ((1 << (p - at)) - 1)).count_ones();
+                            ends &= ends - 1;
+                            let len = p - start;
+                            match field {
+                                0 => id = digits(b, start, len),
+                                1 => name = text(b, start, len, before - field_quotes),
+                                2 => note_len = text(b, start, len, before - field_quotes).2,
+                                3 => g = *group.get(digits(b, start, len) as usize).unwrap_or(&(unmatched as u8)) as usize,
+                                _ => {
+                                    // The amount, [-]digits.dd, then the CR of a CRLF.
+                                    let neg = b[start] == b'-';
+                                    let (s, e) = (start + neg as usize, p - (b[p - 1] == b'\r') as usize);
+                                    let cents = (digits(b, s, e - 3 - s) * 100 + digits(b, e - 2, 2)) as i64;
+                                    let cents = if neg { -cents } else { cents };
+                                    let a = &mut agg[g];
+                                    a.count += 1;
+                                    a.ids += id;
+                                    a.sum += cents;
+                                    a.min = a.min.min(cents);
+                                    a.max = a.max.max(cents);
+                                    a.name_bytes += name.2;
+                                    a.note_bytes += note_len;
+                                    let bit = g << SLOT_BITS | slot_of(name.0, name.1);
+                                    if seen[bit / 64].load(Relaxed) >> (bit % 64) & 1 == 0 {
+                                        seen[bit / 64].fetch_or(1 << (bit % 64), Relaxed);
+                                    }
+                                }
+                            }
+                            (start, field_quotes, field) = (p + 1, before, (field + 1) % 5);
+                            if field == 0 && b.get(start) == Some(&0xEF) {
+                                start += 3;
+                            }
                         }
-                        let id = num(b, &mut i);
-                        let (name_at, name_raw, name_len) = field(b, &mut i);
-                        let (_, _, note_len) = field(b, &mut i);
-                        let g = *group.get(num(b, &mut i) as usize).unwrap_or(&(unmatched as u8)) as usize;
-                        let neg = b[i] == b'-';
-                        i += neg as usize;
-                        let cents = (num(b, &mut i) * 100 + (b[i] - b'0') as u64 * 10 + (b[i + 1] - b'0') as u64) as i64;
-                        let cents = if neg { -cents } else { cents };
-                        i += 2 + (b[i + 2] == b'\r') as usize + 1;
-
-                        let a = &mut agg[g];
-                        a.count += 1;
-                        a.ids += id;
-                        a.sum += cents;
-                        a.min = a.min.min(cents);
-                        a.max = a.max.max(cents);
-                        a.name_bytes += name_len;
-                        a.note_bytes += note_len;
-                        let bit = g << SLOT_BITS | slot_of(name_at, name_raw);
-                        if seen[bit / 64].load(Relaxed) >> (bit % 64) & 1 == 0 {
-                            seen[bit / 64].fetch_or(1 << (bit % 64), Relaxed);
-                        }
+                        quotes += q.count_ones();
+                        at += 64;
                     }
                     agg
                 })

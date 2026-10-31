@@ -17,5 +17,6 @@ Where step 1's parsing time goes, by switching parts off (median of 5 runs): rea
 |---|---|---|---|
 | Field ends from 64-byte bitmasks: quote bits prefix-xored mark the bytes inside quotes, and the commas and LFs outside them end the fields; masks from 64-bit word arithmetic | 126 → 164 | 1 of 10 | no, slower |
 | The same, masks from AVX2 compares | 111 → 119 | 5 of 10 | no, no gain: finding the field ends is not what limits it |
+| The AVX2 field ends, plus each number's digits parsed in one 8-byte step and each name hashed 8 bytes at a time | 96 → 85 | 10 of 12 (1 tie) | yes, pending a board run: 240 → 285 code lines cost about 0.6 points, so it needs about 5% less time there |
 
 A C++ port of the step 1 parser (commit 01c8a40) ran 3.5% faster on the board but its extra code lowered the score to 70.46, so it was reverted (commit 171aa0e).
