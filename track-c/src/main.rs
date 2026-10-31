@@ -6,7 +6,10 @@ use std::thread;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
 }
+
+const PR_SET_THP_DISABLE: i32 = 41;
 
 /// The whole file, read-only. /data is already in the page cache, so this costs no memory.
 /// n zeroed atomics (all-zero bytes are valid), whose pages the kernel supplies only when first touched.
@@ -121,6 +124,8 @@ struct Agg {
 }
 
 fn main() {
+    // No transparent huge pages: one would back a mostly untouched stretch of a lazily filled table.
+    unsafe { prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) };
     // A country code [A-Z]{3} is its own index into 26^3 slots, already in byte order.
     let regions = map("/data/regions.csv");
     let mut i = regions.iter().position(|&c| c == b'\n').unwrap() + 1;
@@ -138,6 +143,7 @@ fn main() {
     let mut rank = vec![unmatched as u8; used.len() + 1];
     codes.iter().enumerate().for_each(|(r, &c)| rank[c] = r as u8);
     let group: Vec<u8> = region.iter().map(|&c| rank[(c as usize).min(used.len())]).collect();
+    drop(region);
 
     // Every distinct name gets a slot in one shared open-addressing table, and each group
     // marks the slots of its names in its own bitset.
