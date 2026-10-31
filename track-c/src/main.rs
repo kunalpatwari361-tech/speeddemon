@@ -9,6 +9,12 @@ extern "C" {
 }
 
 /// The whole file, read-only. /data is already in the page cache, so this costs no memory.
+/// n zeroed atomics (all-zero bytes are valid), whose pages the kernel supplies only when first touched.
+fn zeroed(n: usize) -> Vec<AtomicU64> {
+    let layout = std::alloc::Layout::array::<AtomicU64>(n.max(1)).unwrap();
+    unsafe { Vec::from_raw_parts(std::alloc::alloc_zeroed(layout) as *mut AtomicU64, n, n.max(1)) }
+}
+
 fn map(path: &str) -> &'static [u8] {
     let f = File::open(path).unwrap();
     let len = f.metadata().unwrap().len() as usize;
@@ -76,7 +82,7 @@ fn money(c: i64) -> String {
     format!("{}{}.{:02}", if c < 0 { "-" } else { "" }, c.abs() / 100, c.abs() % 100)
 }
 
-const SLOT_BITS: u32 = 18; // the name pool is 100,000 values
+const SLOT_BITS: u32 = 17; // the name pool is 100,000 values: 2^17 slots, 76% full
 
 #[derive(Clone, Copy)]
 struct Agg {
@@ -111,8 +117,8 @@ fn main() {
     // Every distinct name gets a slot in one shared open-addressing table, and each group
     // marks the slots of its names in its own bitset.
     let b = map("/data/records.csv");
-    let slots: Vec<AtomicU64> = (0..1usize << SLOT_BITS).map(|_| AtomicU64::new(0)).collect();
-    let seen: Vec<AtomicU64> = (0..(unmatched + 1) << (SLOT_BITS - 6)).map(|_| AtomicU64::new(0)).collect();
+    let slots: Vec<AtomicU64> = zeroed(1 << SLOT_BITS);
+    let seen: Vec<AtomicU64> = zeroed((unmatched + 1) << (SLOT_BITS - 6));
     // A slot holds a name's 64-bit hash, which identifies it among the 100,000 (a collision is
     // about 1 in 4 billion).
     let slot_of = |at: usize, len: usize| {
