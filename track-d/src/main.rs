@@ -51,25 +51,16 @@ fn cuts(b: &[u8], from: usize, k: usize) -> Vec<usize> {
 /// Node ids fit in the low bits of a heap entry; distances, below 2^43 for this generator, above them.
 const NODE_BITS: u32 = 21;
 
-/// Dijkstra from s, stopping when t is settled. Leaves dist all u64::MAX again.
-/// Dijkstra from s, stopping when t is settled, over a table of D, whose MAX means unreached.
-/// None if a distance does not fit below D's MAX. Leaves dist all MAX again.
-fn search<D: Copy + Into<u64> + TryFrom<u64>>(
-    off: &[u32],
-    adj: &[u64],
-    dist: &mut [D],
-    max: D,
-    seen: &mut Vec<usize>,
-    s: usize,
-    t: usize,
-) -> Option<i64> {
+/// Dijkstra from s, stopping when t is settled, over a zeroed table of D holding distance + 1
+/// (0 is unreached). None if a distance does not fit in D. Leaves the table zeroed again.
+fn search<D: Copy + Default + Into<u64> + TryFrom<u64>>(off: &[u32], adj: &[u64], dist: &mut [D], seen: &mut Vec<usize>, s: usize, t: usize) -> Option<i64> {
     let mut heap = BinaryHeap::from([Reverse(s as u64)]);
-    dist[s] = D::try_from(0).ok()?;
+    dist[s] = D::try_from(1).ok()?;
     seen.push(s);
     let mut found = Some(-1);
     'search: while let Some(Reverse(top)) = heap.pop() {
         let (d, u) = (top >> NODE_BITS, (top & ((1 << NODE_BITS) - 1)) as usize);
-        if d > dist[u].into() {
+        if d + 1 > dist[u].into() {
             continue;
         }
         if u == t {
@@ -78,12 +69,13 @@ fn search<D: Copy + Into<u64> + TryFrom<u64>>(
         }
         for &e in &adj[off[u] as usize..off[u + 1] as usize] {
             let (v, nd) = ((e >> 32) as usize, d + (e & 0xffff_ffff));
-            let Some(x) = D::try_from(nd).ok().filter(|_| nd < max.into()) else {
+            let Ok(x) = D::try_from(nd + 1) else {
                 found = None;
                 break 'search;
             };
-            if nd < dist[v].into() {
-                if dist[v].into() == max.into() {
+            let old: u64 = dist[v].into();
+            if old == 0 || nd + 1 < old {
+                if old == 0 {
                     seen.push(v);
                 }
                 dist[v] = x;
@@ -91,7 +83,7 @@ fn search<D: Copy + Into<u64> + TryFrom<u64>>(
             }
         }
     }
-    seen.drain(..).for_each(|v| dist[v] = max);
+    seen.drain(..).for_each(|v| dist[v] = D::default());
     found
 }
 
@@ -212,39 +204,47 @@ fn main() {
     drop((off, adj, regions));
     let (off, adj) = (off2, adj2);
 
+    // Queries sorted by renumbered source, one block per thread, so a thread's searches stay in one
+    // part of the graph and touch only that part of its lazily zeroed distance table. A thread that
+    // finishes its block helps with the others.
     let q = map("/data/queries.txt");
     let mut i = 0;
     let mut queries = Vec::new();
     while i < q.len() {
         queries.push((num(q, &mut i) as usize, num(q, &mut i) as usize));
     }
+    let mut order: Vec<usize> = (0..queries.len()).collect();
+    order.sort_unstable_by_key(|&j| new[queries[j].0]);
+    let blocks: Vec<&[usize]> = (0..k).map(|b| &order[order.len() * b / k..order.len() * (b + 1) / k]).collect();
+    let taken: Vec<AtomicUsize> = (0..k).map(|_| AtomicUsize::new(0)).collect();
     let answers: Vec<AtomicU64> = queries.iter().map(|_| AtomicU64::new(0)).collect();
-    let todo = AtomicUsize::new(0);
     let wide = std::sync::Mutex::new(Vec::new());
     thread::scope(|s| {
-        for _ in 0..k.min(queries.len()) {
-            s.spawn(|| {
+        for me in 0..k {
+            let (blocks, taken, queries, answers, wide, off, adj, new, has_in) = (&blocks, &taken, &queries, &answers, &wide, &off, &adj, &new, &has_in);
+            s.spawn(move || {
                 // Distances fit in 32 bits except near the few edges of weight about 2^32; only
                 // those searches are redone, one at a time, over a shared 64-bit table.
-                let (mut dist, mut seen) = (vec![u32::MAX; n], Vec::new());
-                loop {
-                    let j = todo.fetch_add(1, Relaxed);
-                    let Some(&(src, t)) = queries.get(j) else { break };
-                    let (s, t2) = (new[src] as usize, new[t] as usize);
-                    let d = if src == t {
-                        0
-                    } else if has_in[t / 64].load(Relaxed) >> (t % 64) & 1 == 0 {
-                        -1
-                    } else if let Some(d) = search(&off, &adj, &mut dist, u32::MAX, &mut seen, s, t2) {
-                        d
-                    } else {
-                        let mut wide = wide.lock().unwrap();
-                        if wide.is_empty() {
-                            *wide = vec![u64::MAX; n];
-                        }
-                        search(&off, &adj, &mut wide, u64::MAX, &mut seen, s, t2).unwrap()
-                    };
-                    answers[j].store(d as u64, Relaxed);
+                let (mut dist, mut seen) = (vec![0u32; n], Vec::new());
+                for b in (0..k).map(|x| (me + x) % k) {
+                    while let Some(&j) = blocks[b].get(taken[b].fetch_add(1, Relaxed)) {
+                        let (src, t) = queries[j];
+                        let (s, t2) = (new[src] as usize, new[t] as usize);
+                        let d = if src == t {
+                            0
+                        } else if has_in[t / 64].load(Relaxed) >> (t % 64) & 1 == 0 {
+                            -1
+                        } else if let Some(d) = search(off, adj, &mut dist, &mut seen, s, t2) {
+                            d
+                        } else {
+                            let mut wide = wide.lock().unwrap();
+                            if wide.is_empty() {
+                                *wide = vec![0u64; n];
+                            }
+                            search(off, adj, &mut wide, &mut seen, s, t2).unwrap()
+                        };
+                        answers[j].store(d as u64, Relaxed);
+                    }
                 }
             });
         }
