@@ -5,7 +5,7 @@ Every step from the reference to your final version, each with the live-board ru
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 72.69 | 893 | 0 |
-| 1 | | | | | |
+| 1 | Packed radix heap for the search, its buckets kept between queries | run-4a3cd5f77eb4 | 0.3426 | 147.3 | 59.36 |
 
 ## Experiments on the laptop (not board runs)
 
