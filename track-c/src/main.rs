@@ -116,13 +116,7 @@ fn main() {
     // A slot holds a name's 64-bit hash, which identifies it among the 100,000 (a collision is
     // about 1 in 4 billion).
     let slot_of = |at: usize, len: usize| {
-        // The name hashed 8 bytes at a time (the last piece zero-padded), so a name costs a few
-        // multiplies, not one per byte.
-        let hash = b[at..at + len].chunks(8).fold(len as u64, |h, c| {
-            let mut w = [0u8; 8];
-            w[..c.len()].copy_from_slice(c);
-            (h ^ u64::from_le_bytes(w)).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29)
-        }) | 1;
+        let hash = b[at..at + len].iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &c| (h ^ c as u64).wrapping_mul(0x100_0000_01b3)) | 1;
         let mut s = (hash.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - SLOT_BITS)) as usize;
         loop {
             match slots[s].load(Relaxed) {
