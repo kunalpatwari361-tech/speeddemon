@@ -1,5 +1,3 @@
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -51,15 +49,70 @@ fn cuts(b: &[u8], from: usize, k: usize) -> Vec<usize> {
 /// Node ids fit in the low bits of a heap entry; distances, below 2^43 for this generator, above them.
 const NODE_BITS: u32 = 21;
 
+/// A radix heap: a priority queue for distances that never fall below the last one popped, which Dijkstra's
+/// never do. An entry waits in the bucket of the highest bit where its distance differs from the last one
+/// popped, and moves to a lower bucket each time its bucket is redistributed. An entry packs its node id into
+/// the low NODE_BITS bits, so distances must stay below 2^43, as they do for this generator.
+struct RadixHeap {
+    last: u64,
+    len: usize,
+    buckets: [Vec<u64>; 65],
+}
+
+impl RadixHeap {
+    fn new() -> Self {
+        RadixHeap { last: 0, len: 0, buckets: std::array::from_fn(|_| Vec::new()) }
+    }
+
+    /// Empties the heap but keeps its buckets' storage for the next search.
+    fn clear(&mut self) {
+        for bucket in &mut self.buckets {
+            bucket.clear();
+        }
+        self.last = 0;
+        self.len = 0;
+    }
+
+    fn push(&mut self, d: u64, v: u32) {
+        self.buckets[bucket(d, self.last)].push(d << NODE_BITS | v as u64);
+        self.len += 1;
+    }
+
+    /// Removes an entry with the smallest distance, as (distance, node).
+    fn pop(&mut self) -> Option<(u64, u32)> {
+        if self.len == 0 {
+            return None;
+        }
+        if self.buckets[0].is_empty() {
+            let i = (1..65).find(|&i| !self.buckets[i].is_empty()).unwrap();
+            let mut moved = std::mem::take(&mut self.buckets[i]);
+            self.last = moved.iter().map(|&e| e >> NODE_BITS).min().unwrap();
+            for &e in &moved {
+                self.buckets[bucket(e >> NODE_BITS, self.last)].push(e);
+            }
+            moved.clear();
+            self.buckets[i] = moved;
+        }
+        self.len -= 1;
+        self.buckets[0].pop().map(|e| (e >> NODE_BITS, (e & ((1 << NODE_BITS) - 1)) as u32))
+    }
+}
+
+/// The bucket of a distance: 0 when it equals the last one popped, else one more than the highest bit where they differ.
+fn bucket(d: u64, last: u64) -> usize {
+    (64 - (d ^ last).leading_zeros()) as usize
+}
+
 /// Dijkstra from s, stopping when t is settled, over a zeroed table of D holding distance + 1
 /// (0 is unreached). None if a distance does not fit in D. Leaves the table zeroed again.
-fn search<D: Copy + Default + Into<u64> + TryFrom<u64>>(off: &[u32], adj: &[u64], dist: &mut [D], seen: &mut Vec<usize>, s: usize, t: usize) -> Option<i64> {
-    let mut heap = BinaryHeap::from([Reverse(s as u64)]);
+fn search<D: Copy + Default + Into<u64> + TryFrom<u64>>(off: &[u32], adj: &[u64], dist: &mut [D], seen: &mut Vec<usize>, heap: &mut RadixHeap, s: usize, t: usize) -> Option<i64> {
+    heap.clear();
+    heap.push(0, s as u32);
     dist[s] = D::try_from(1).ok()?;
     seen.push(s);
     let mut found = Some(-1);
-    'search: while let Some(Reverse(top)) = heap.pop() {
-        let (d, u) = (top >> NODE_BITS, (top & ((1 << NODE_BITS) - 1)) as usize);
+    'search: while let Some((d, u)) = heap.pop() {
+        let u = u as usize;
         if d + 1 > dist[u].into() {
             continue;
         }
@@ -79,7 +132,7 @@ fn search<D: Copy + Default + Into<u64> + TryFrom<u64>>(off: &[u32], adj: &[u64]
                     seen.push(v);
                 }
                 dist[v] = x;
-                heap.push(Reverse(nd << NODE_BITS | v as u64));
+                heap.push(nd, v as u32);
             }
         }
     }
@@ -225,7 +278,7 @@ fn main() {
             s.spawn(move || {
                 // Distances fit in 32 bits except near the few edges of weight about 2^32; only
                 // those searches are redone, one at a time, over a shared 64-bit table.
-                let (mut dist, mut seen) = (vec![0u32; n], Vec::new());
+                let (mut dist, mut seen, mut heap) = (vec![0u32; n], Vec::new(), RadixHeap::new());
                 for b in (0..k).map(|x| (me + x) % k) {
                     while let Some(&j) = blocks[b].get(taken[b].fetch_add(1, Relaxed)) {
                         let (src, t) = queries[j];
@@ -234,14 +287,14 @@ fn main() {
                             0
                         } else if has_in[t / 64].load(Relaxed) >> (t % 64) & 1 == 0 {
                             -1
-                        } else if let Some(d) = search(off, adj, &mut dist, &mut seen, s, t2) {
+                        } else if let Some(d) = search(off, adj, &mut dist, &mut seen, &mut heap, s, t2) {
                             d
                         } else {
                             let mut wide = wide.lock().unwrap();
                             if wide.is_empty() {
                                 *wide = vec![0u64; n];
                             }
-                            search(off, adj, &mut wide, &mut seen, s, t2).unwrap()
+                            search(off, adj, &mut wide, &mut seen, &mut heap, s, t2).unwrap()
                         };
                         answers[j].store(d as u64, Relaxed);
                     }
