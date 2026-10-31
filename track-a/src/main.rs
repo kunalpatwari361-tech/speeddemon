@@ -173,15 +173,20 @@ fn main() {
     eps.sort_unstable();
 
     // Every group's latencies get one run of a flat array, laid out in output order; each thread
-    // fills its own part of every run, its count becoming its cursor within the run.
+    // fills its own part of every run, its count becoming its cursor within the run. Cursors are
+    // set in memory order, and the runs are placed afterwards.
     let (mut start, mut end) = (vec![0u32; SLOTS * HOURS], vec![0u32; SLOTS * HOURS]);
-    let (mut cursors, mut at) = (counts, 0);
-    for g in (0..HOURS).flat_map(|h| eps.iter().map(move |&(_, s)| s * HOURS + h)) {
+    let mut cursors = counts;
+    for g in (0..SLOTS * HOURS).filter(|&g| ep.slots[g / HOURS].load(Relaxed) != 0) {
         let mut size = 0;
         for c in cursors.iter_mut() {
             (c[g], size) = (size, size + c[g]);
         }
-        (start[g], end[g], at) = (at, at + size as u32, at + size as u32);
+        end[g] = size as u32;
+    }
+    let mut at = 0;
+    for g in (0..HOURS).flat_map(|h| eps.iter().map(move |&(_, s)| s * HOURS + h)) {
+        (start[g], end[g], at) = (at, at + end[g], at + end[g]);
     }
     let lat = zeroed(at as usize);
     thread::scope(|s| {
