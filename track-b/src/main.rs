@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::thread;
 
 extern "C" {
@@ -9,15 +9,6 @@ extern "C" {
 }
 
 /// The whole file, read-only. /data is already in the page cache, so this costs no memory.
-fn map(path: &str) -> &'static [u8] {
-    let f = File::open(path).unwrap();
-    let len = f.metadata().unwrap().len() as usize;
-    if len == 0 {
-        return &[];
-    }
-    unsafe { std::slice::from_raw_parts(mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0), len) }
-}
-
 /// n zeroed values (all-zero bytes are valid for these atomics), whose pages the kernel supplies
 /// only when first touched.
 fn zeroed<T>(n: usize) -> Vec<T> {
@@ -25,13 +16,13 @@ fn zeroed<T>(n: usize) -> Vec<T> {
     unsafe { Vec::from_raw_parts(std::alloc::alloc_zeroed(layout) as *mut T, n, n.max(1)) }
 }
 
-/// Runs f(j) for j in 0..n, each on its own thread, and returns the results in order.
-fn par<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
-    thread::scope(|s| {
-        let f = &f;
-        let hs: Vec<_> = (0..n).map(|j| s.spawn(move || f(j))).collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    })
+fn map(path: &str) -> &'static [u8] {
+    let f = File::open(path).unwrap();
+    let len = f.metadata().unwrap().len() as usize;
+    if len == 0 {
+        return &[];
+    }
+    unsafe { std::slice::from_raw_parts(mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0), len) }
 }
 
 /// Open addressing from a non-zero 64-bit key to a dense id, in insertion order, behind a 64 KB
@@ -76,9 +67,8 @@ impl Table {
         }
         self.slots[s].1
     }
-    /// The same map in the smallest table that holds it, so lookups stay in cache. The old table
-    /// is freed.
-    fn compact(self) -> Table {
+    /// The same map in the smallest table that holds it, so lookups stay in cache.
+    fn compact(&self) -> Table {
         let mut t = Table::new(self.len as usize);
         t.filter.clone_from(&self.filter);
         for &(k, id) in self.slots.iter().filter(|s| s.0 != 0) {
@@ -145,11 +135,10 @@ struct Index<'a> {
 }
 
 impl Index<'_> {
-    /// Calls f(doc, id, previous, value) once per document for every query term and phrase pair
-    /// it contains, where previous is the id's last document + 1 in this part (0 if none). Pair
-    /// ids follow the term ids. state[id] is (last document + 1, value), kept together so a hit
-    /// touches one place. Also records where each document's text lies.
-    fn scan(&self, from: usize, to: usize, state: &mut [(u32, u32)], span: &[AtomicU64], mut f: impl FnMut(u32, usize, u32, &mut u32)) {
+    /// Calls f(doc, id, value) once per document for every query term and phrase pair it
+    /// contains; pair ids follow the term ids. state[id] is (last document + 1, value), kept
+    /// together so a hit touches one place. Also records where each document's text lies.
+    fn scan(&self, from: usize, to: usize, state: &mut [(u32, u32)], span: &[AtomicU64], mut f: impl FnMut(u32, usize, &mut u32)) {
         let (b, nt) = (self.docs, self.terms.len as usize);
         let mut i = from;
         while i < to {
@@ -160,9 +149,8 @@ impl Index<'_> {
             let mut hit = |id: usize| {
                 let e = &mut state[id];
                 if e.0 != doc + 1 {
-                    let prev = e.0;
                     e.0 = doc + 1;
-                    f(doc, id, prev, &mut e.1);
+                    f(doc, id, &mut e.1);
                 }
             };
             let (mut j, mut prev) = (tab + 1, None);
@@ -187,63 +175,6 @@ impl Index<'_> {
             }
             i = end + 1;
         }
-    }
-}
-
-/// One part's hits in the full pass, as u32s in document order: a document marker (top bit set),
-/// then the ids of that document's hits. Kept in chunks, so placement frees each one as it goes.
-#[derive(Default)]
-struct Stream(Vec<Vec<u32>>);
-
-const CHUNK: usize = 1 << 16;
-
-/// Flags a state value as a dense id's bitset index (rare ids hold their byte count instead).
-const DENSE: u32 = 1 << 31;
-
-impl Stream {
-    fn push(&mut self, v: u32) {
-        match self.0.last_mut() {
-            Some(c) if c.len() < CHUNK => c.push(v),
-            _ => {
-                let mut c = Vec::with_capacity(CHUNK);
-                c.push(v);
-                self.0.push(c);
-            }
-        }
-    }
-}
-
-/// The bytes a posting takes, given prev, the previous document + 1 of its id in the same part (0
-/// for the first in the part): a 2-byte gap, or else the marker 0xFFFF and the document (6 bytes).
-fn gap_len(prev: u32, doc: u32) -> u32 {
-    if prev != 0 && doc + 1 - prev < 0xFFFF {
-        2
-    } else {
-        6
-    }
-}
-
-/// Writes bytes at buf[p..].
-fn store(buf: &[AtomicU8], p: usize, bytes: &[u8]) {
-    for (i, &b) in bytes.iter().enumerate() {
-        buf[p + i].store(b, Relaxed);
-    }
-}
-
-/// Fills out with the documents of a rare id from its region of the postings buffer, ascending.
-fn decode(postings: &[u8], (mut p, end): (usize, usize), out: &mut Vec<u32>) {
-    out.clear();
-    let mut doc = 0;
-    while p < end {
-        let gap = u16::from_le_bytes([postings[p], postings[p + 1]]);
-        if gap == 0xFFFF {
-            doc = u32::from_le_bytes(postings[p + 2..p + 6].try_into().unwrap());
-            p += 6;
-        } else {
-            doc += gap as u32;
-            p += 2;
-        }
-        out.push(doc);
     }
 }
 
@@ -284,12 +215,10 @@ fn eval<'a>(steps: impl Iterator<Item = (u8, Set<'a>)>, r: &mut [u64], v: &mut V
             (b'A', Set::Ids(a), true) => (v.clear(), v.extend(a.iter().filter(|&&d| has(r, d))), dense = false).0,
             (b'O', Set::Ids(a), true) => a.iter().for_each(|&d| r[d as usize / 64] |= 1 << (d % 64)),
             (_, Set::Ids(a), true) => a.iter().for_each(|&d| r[d as usize / 64] &= !(1 << (d % 64))),
-            (_, Set::Bits(b), true) => r.iter_mut().zip(b).for_each(|(x, &y)| {
-                *x = match op {
-                    b'A' => *x & y,
-                    b'O' => *x | y,
-                    _ => *x & !y,
-                }
+            (_, Set::Bits(b), true) => r.iter_mut().zip(b).for_each(|(x, &y)| *x = match op {
+                b'A' => *x & y,
+                b'O' => *x | y,
+                _ => *x & !y,
             }),
         }
     }
@@ -336,146 +265,113 @@ fn main() {
     let span: Vec<AtomicU64> = zeroed(n);
     let k = thread::available_parallelism().map_or(1, |x| x.get());
     let parts = cuts(docs, k);
-    let nparts = parts.len() - 1;
 
-    // A sample, the first thirty-second of every part, estimates which ids are common (in at least
-    // one document in 32). Those get a bitset over all documents, which the full pass sets directly.
-    let sample = par(nparts, |j| {
-        let mut state = vec![(0u32, 0u32); ids];
-        index.scan(parts[j], parts[j] + (parts[j + 1] - parts[j]) / 32, &mut state, &span, |_, _, _, c| *c += 1);
-        state.iter().map(|s| s.1).collect::<Vec<u32>>()
+    // Runs f(part, state) on every part in parallel, each thread with its own state.
+    let each = |f: &(dyn Fn(usize, &mut [(u32, u32)]) -> Vec<u32> + Sync)| -> Vec<Vec<u32>> {
+        thread::scope(|s| {
+            let hs: Vec<_> = (0..parts.len() - 1).map(|j| s.spawn(move || f(j, &mut vec![(0, 0); ids]))).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        })
+    };
+
+    // A sample, the first thirty-second of every part, estimates which ids are common. Those get a
+    // bitset over all documents, which the full pass sets directly.
+    let sample = each(&|j, state| {
+        index.scan(parts[j], parts[j] + (parts[j + 1] - parts[j]) / 32, state, &span, |_, _, c| *c += 1);
+        state.iter().map(|s| s.1).collect()
     });
     let mut nbits = 0;
     let bit_of: Vec<Option<usize>> = (0..ids)
         .map(|id| (sample.iter().map(|s| s[id] as usize).sum::<usize>() * 32 * 32 >= n).then(|| (nbits, nbits += 1).0))
         .collect();
-    drop(sample);
     let bits: Vec<AtomicU64> = zeroed(nbits * words);
 
-    // The full pass: a common id sets its bit; every other hit goes to the part's stream, and the
-    // size of its gap is added to the id's byte count. A state value is the dense bitset
-    // index (flagged) for a common id, else the byte count its postings will take.
-    let streams: Vec<(Stream, Vec<(u32, u32)>)> = par(nparts, |j| {
-        let mut state: Vec<(u32, u32)> = bit_of
-            .iter()
-            .map(|b| (0, match *b {
-                Some(b) => DENSE | b as u32,
-                None => 0,
-            }))
-            .collect();
-        let (mut stream, mut last) = (Stream::default(), u32::MAX);
-        index.scan(parts[j], parts[j + 1], &mut state, &span, |doc, id, prev, value| {
-            if *value & DENSE != 0 {
-                let w = &bits[(*value & !DENSE) as usize * words + doc as usize / 64];
+    // The full pass: a common id sets its bit; every other hit goes to the thread's stream as
+    // its id, after a marker (top bit set) naming the document.
+    let streams = each(&|j, state| {
+        // Each id's state holds its dense bitset index (or u32::MAX): one lookup per hit.
+        for (s, b) in state.iter_mut().zip(&bit_of) {
+            s.1 = match *b {
+                Some(b) => b as u32,
+                None => u32::MAX,
+            };
+        }
+        let rare: usize = (0..ids).filter(|&id| bit_of[id].is_none()).map(|id| sample[j][id] as usize).sum();
+        let (mut stream, mut last) = (Vec::with_capacity(rare * 33 + n / k), u32::MAX);
+        index.scan(parts[j], parts[j + 1], state, &span, |doc, id, dense| {
+            if *dense != u32::MAX {
+                let w = &bits[*dense as usize * words + doc as usize / 64];
                 w.store(w.load(Relaxed) | 1 << (doc % 64), Relaxed);
             } else {
-                // The gap from the id's previous posting in this part (from 0 for the first).
-                *value += gap_len(prev, doc);
                 if doc != last {
-                    last = doc;
-                    stream.push(1 << 31 | doc);
+                    (last, _) = (doc, stream.push(1 << 31 | doc));
                 }
                 stream.push(id as u32);
             }
         });
-        (stream, state.iter().map(|s| (if s.1 & DENSE != 0 { 0 } else { s.1 }, 0)).collect())
+        stream
     });
+    drop(sample);
 
-    // Each id's postings are one region of a shared buffer: its parts' segments, in part order.
-    // Every part first gets, for each id, where its own segment starts inside that region.
-    // Each id's postings are one region of a shared buffer: its parts' segments, in part order.
-    // Every part gets, for each id, where its own segment starts inside that region (its cursor),
-    // and the document + 1 of its last posting for the id (0 if none).
-    let mut totals = vec![0u32; ids];
-    for (_, sizes) in &streams {
-        for (t, &(size, _)) in totals.iter_mut().zip(sizes) {
-            *t += size;
+    // The other ids get a run of one flat array: count each thread's hits per id, then each
+    // thread places its stream into its own part of every run.
+    let mut counts = each(&|j, _| {
+        let mut count = vec![0u32; ids];
+        streams[j].iter().filter(|&&v| v >> 31 == 0).for_each(|&v| count[v as usize] += 1);
+        count
+    });
+    let df: Vec<usize> = (0..ids).map(|id| counts.iter().map(|c| c[id] as usize).sum()).collect();
+    let mut nflat = 0;
+    let start: Vec<usize> = df.iter().map(|&d| (nflat, nflat += d).0).collect();
+    for id in 0..ids {
+        let mut at = start[id] as u32;
+        for c in counts.iter_mut() {
+            (c[id], at) = (at, at + c[id]);
         }
     }
-    let mut starts = vec![0u32; ids + 1];
-    for x in 0..ids {
-        starts[x + 1] = starts[x] + totals[x];
-    }
-    drop(totals);
-    let mut next = starts[..ids].to_vec();
-    let mut cursored: Vec<(Stream, Vec<(u32, u32)>)> = streams
-        .into_iter()
-        .map(|(stream, mut cursor)| {
-            for (c, n) in cursor.iter_mut().zip(next.iter_mut()) {
-                let size = c.0;
-                *c = (*n, 0);
-                *n += size;
-            }
-            (stream, cursor)
-        })
-        .collect();
-    drop(next);
-    let postings: Vec<AtomicU8> = zeroed(starts[ids] as usize);
-    let buf: &[AtomicU8] = &postings;
+    let flat: Vec<AtomicU32> = zeroed(nflat);
     thread::scope(|s| {
-        for (stream, mut cursor) in cursored.drain(..) {
+        for (stream, mut cur) in streams.into_iter().zip(counts) {
+            let flat = &flat;
             s.spawn(move || {
                 let mut doc = 0;
-                for v in stream.0.into_iter().flatten() {
+                for v in stream {
                     if v >> 31 == 1 {
                         doc = v & !(1 << 31);
                     } else {
-                        let x = v as usize;
-                        let (p, prev) = (cursor[x].0 as usize, cursor[x].1);
-                        let q = if prev != 0 && doc + 1 - prev < 0xFFFF {
-                            store(buf, p, &((doc + 1 - prev) as u16).to_le_bytes());
-                            p + 2
-                        } else {
-                            store(buf, p, &0xFFFFu16.to_le_bytes());
-                            store(buf, p + 2, &doc.to_le_bytes());
-                            p + 6
-                        };
-                        cursor[x] = (q as u32, doc + 1);
+                        flat[cur[v as usize] as usize].store(doc, Relaxed);
+                        cur[v as usize] += 1;
                     }
                 }
             });
         }
     });
-    let postings: Vec<u8> = postings.into_iter().map(AtomicU8::into_inner).collect();
     let bits: Vec<u64> = bits.into_iter().map(AtomicU64::into_inner).collect();
-
-    // Answer the queries in k contiguous blocks, each into its own buffer. Rare ids are decoded
-    // into a per-step scratch list; common ids are read from their bitsets.
+    let flat: Vec<u32> = flat.into_iter().map(AtomicU32::into_inner).collect();
     let nt = index.terms.len;
-    let resolve = |id: u32| if id >> 31 == 1 { (nt + (id & !(1 << 31))) as usize } else { id as usize };
+    let set = |id: u32| {
+        let id = if id >> 31 == 1 { (nt + (id & !(1 << 31))) as usize } else { id as usize };
+        match bit_of[id] {
+            Some(b) => Set::Bits(&bits[b * words..][..words]),
+            None => Set::Ids(&flat[start[id]..start[id] + df[id]]),
+        }
+    };
+
+    // Answer the queries in k contiguous blocks, each into its own buffer.
     let outs: Vec<Vec<u8>> = thread::scope(|s| {
         let hs: Vec<_> = queries
             .chunks(queries.len().div_ceil(k).max(1))
             .map(|block| {
-                let (postings, starts, bit_of, bits, resolve, span, docs) = (&postings, &starts, &bit_of, &bits, &resolve, &span, docs);
+                let (set, span) = (&set, &span);
                 s.spawn(move || {
-                    let (mut r, mut v, mut out, mut toks) = (vec![0u64; words], Vec::new(), Vec::new(), Vec::new());
-                    let mut scratch: Vec<Vec<u32>> = Vec::new();
+                    let (mut r, mut v, mut out) = (vec![0u64; words], Vec::new(), Vec::new());
                     for (steps, phrase) in block {
-                        if scratch.len() < steps.len() {
-                            scratch.resize_with(steps.len(), Vec::new);
-                        }
-                        for (list, &(_, id)) in scratch.iter_mut().zip(steps) {
-                            let x = resolve(id);
-                            if bit_of[x].is_none() {
-                                decode(postings, (starts[x] as usize, starts[x + 1] as usize), list);
-                            }
-                        }
-                        let sets = steps.iter().zip(&scratch).map(|(&(op, id), list)| {
-                            let x = resolve(id);
-                            let set = match bit_of[x] {
-                                Some(b) => Set::Bits(&bits[b * words..][..words]),
-                                None => Set::Ids(list),
-                            };
-                            (op, set)
-                        });
-                        eval(sets, &mut r, &mut v);
+                        eval(steps.iter().map(|&(op, id)| (op, set(id))), &mut r, &mut v);
                         if phrase.len() > 2 {
                             // Every adjacent pair occurs; check the words occur together, in order.
                             v.retain(|&d| {
                                 let sp = span[d as usize].load(Relaxed);
-                                toks.clear();
-                                toks.extend(tokens(&docs[(sp >> 32) as usize..sp as u32 as usize]));
+                                let toks: Vec<&[u8]> = tokens(&docs[(sp >> 32) as usize..sp as u32 as usize]).collect();
                                 toks.windows(phrase.len()).any(|w| w.iter().zip(phrase).all(|(a, b)| a.eq_ignore_ascii_case(b)))
                             });
                         }
