@@ -259,6 +259,7 @@ fn main() {
                         lat[at[s]] = l;
                         at[s] += 1;
                     });
+                    free_hour(parts, h);
                     let text = hour_text(base + h as u64);
                     let mut out = Vec::new();
                     for &(name, s) in eps {
@@ -285,7 +286,6 @@ fn main() {
                         }
                         out.push(b'\n');
                     }
-                    free_hour(parts, h);
                     tx.send((h, out)).unwrap();
                 }
             });

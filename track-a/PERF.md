@@ -34,3 +34,5 @@ Later experiments, each run interleaved against the build before it:
 | Why step 3's memory did not fall on the board: the arena asked for huge pages (madvise MADV_HUGEPAGE), as a kernel with transparent huge pages always on gives them | memory | peak 35.0 to 38.4 MB over 4 runs, as on the board (36.2); without huge pages (MADV_NOHUGEPAGE) 26.1 to 26.6 MB | The arena now refuses huge pages: a 2 MB page holds many hours' chunks, and giving back 4 KB of it only splits it later |
 
 The parse is about 60% of a laptop run. A bare newline count over the same bytes takes 7 to 8 ms, and the scan runs at two to three times that. Track A commits between rows 1 and 2 (0bcc05e, 5fbde5e, 695f577) have no rows: their board runs are no longer in the board data.
+
+Memory, later: an hour's chunk pages go back as soon as its latencies are placed, before its lines are formatted, so they no longer overlap the 12 threads' hour buffers. Laptop, 8 runs each: peak 25.7 to 27.1 MB before (median about 26.1), 23.0 to 24.4 MB after in 7 of 8 runs (median about 23.7); time unchanged.
