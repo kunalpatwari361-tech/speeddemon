@@ -71,23 +71,46 @@ impl Table {
     }
 }
 
-/// A token byte's lowercase, or 0 for a separator (for a letter or digit, c | 0x20 is its lowercase).
-const LOWER: [u8; 256] = {
-    let (mut t, mut c) = ([0u8; 256], 0);
-    while c < 256 {
-        if (c as u8).is_ascii_alphanumeric() {
-            t[c] = c as u8 | 0x20;
-        }
-        c += 1;
-    }
-    t
-};
+const ONES: u64 = 0x0101_0101_0101_0101;
+const HIGH: u64 = 0x8080_8080_8080_8080;
 
-/// A 64-bit hash of a lowercased token stands in for the token itself.
-fn step(h: u64, c: u8) -> u64 {
-    (h ^ LOWER[c as usize] as u64).wrapping_mul(0x100_0000_01b3)
+/// The 8 bytes of b from i, little-endian, with zeros past its end.
+fn load(b: &[u8], i: usize) -> u64 {
+    match b.get(i..i + 8) {
+        Some(w) => u64::from_le_bytes(w.try_into().unwrap()),
+        None => {
+            let mut w = [0u8; 8];
+            w[..b.len() - i].copy_from_slice(&b[i..]);
+            u64::from_le_bytes(w)
+        }
+    }
 }
-const SEED: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// The high bit of every byte of x that is an ASCII letter or digit. Each byte is tested on its
+/// low 7 bits, where adding a constant cannot carry into the next byte.
+fn alnum(x: u64) -> u64 {
+    let (a, l) = (x & !HIGH, x & !HIGH | 0x20 * ONES);
+    let letter = (l + (0x80 - 0x61) * ONES) & !(l + (0x7f - 0x7a) * ONES);
+    let digit = (a + (0x80 - 0x30) * ONES) & !(a + (0x7f - 0x39) * ONES);
+    (letter | digit) & !x & HIGH
+}
+
+/// The token at b[i]: where it ends, and a 64-bit hash of it lowercased (a letter or digit | 0x20
+/// is its lowercase), which stands in for the token. A token of up to 7 bytes is one chunk, so its
+/// hash is unique.
+fn token(b: &[u8], mut i: usize) -> (usize, u64) {
+    let mut h = 0u64;
+    loop {
+        let x = load(b, i);
+        let n = (!alnum(x) & HIGH).trailing_zeros() as usize / 8;
+        let chunk = (x | 0x20 * ONES) & ((1u128 << (8 * n)) - 1) as u64;
+        h = (h ^ chunk).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29);
+        i += n;
+        if n < 8 {
+            return (i, h);
+        }
+    }
+}
 
 /// The key of the adjacent pair (a, b) of term ids.
 fn pair(a: u32, b: u32) -> u64 {
@@ -147,9 +170,7 @@ impl Index<'_> {
         let mut i = from;
         while i < to {
             let tab = i + b[i..].iter().position(|&c| c == b'\t').unwrap();
-            let end = tab + b[tab..].iter().position(|&c| c == b'\n').unwrap();
             let doc = num(&b[i..]) as u32;
-            span[doc as usize].store((tab as u64 + 1) << 32 | end as u64, Relaxed);
             ids.clear();
             let mut hit = |(id, dense): (u32, u32)| {
                 if dense != u32::MAX {
@@ -160,16 +181,21 @@ impl Index<'_> {
                 }
             };
             let (mut j, mut prev) = (tab + 1, None);
-            while j < end {
-                if LOWER[b[j] as usize] == 0 {
-                    j += 1;
+            loop {
+                // The next token or the LF, whichever comes first.
+                let x = load(b, j);
+                let lf = x ^ 0x0a * ONES;
+                let (a, z) = (alnum(x).trailing_zeros(), (lf.wrapping_sub(ONES) & !lf & HIGH).trailing_zeros());
+                if z < a {
+                    j += z as usize / 8;
+                    break;
+                }
+                if a == 64 {
+                    j += 8;
                     continue;
                 }
-                let mut h = SEED;
-                while LOWER[b[j] as usize] != 0 {
-                    h = step(h, b[j]);
-                    j += 1;
-                }
+                let h;
+                (j, h) = token(b, j + a as usize / 8);
                 let cur = self.terms.get(h | 1);
                 if let Some((c, dense)) = cur {
                     hit((c, dense));
@@ -179,7 +205,8 @@ impl Index<'_> {
                 }
                 prev = cur.map(|(c, _)| c);
             }
-            i = end + 1;
+            span[doc as usize].store((tab as u64 + 1) << 32 | j as u64, Relaxed);
+            i = j + 1;
         }
     }
 }
@@ -257,7 +284,7 @@ fn main() {
         let phrase = line.starts_with(b"PHRASE");
         let rest = if phrase { &line[8..line.len() - 1] } else { &line[5..] };
         let words: Vec<&[u8]> = rest.split(|&c| c == b' ').collect();
-        let mut id = |w: &[u8]| terms.add(w.iter().fold(SEED, |h, &c| step(h, c)) | 1);
+        let mut id = |w: &[u8]| terms.add(token(w, 0).1 | 1);
         let steps: Vec<(u8, u32)> = if phrase {
             let ids: Vec<u32> = words.iter().map(|w| id(w)).collect();
             let pair_ids = ids.windows(2).map(|p| pairs.add(pair(p[0], p[1])) | 1 << 31);
