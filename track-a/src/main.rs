@@ -9,6 +9,13 @@ extern "C" {
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 
+// The line scanner, in C++ (native/scan.cpp), built into native/libscan.a by the Dockerfile.
+#[link(name = "scan", kind = "static")]
+extern "C" {
+    fn count_part(b: *const u8, from: usize, to: usize, base: u64, keys: *mut u64, spans: *mut u64, count: *mut u16, errors: *mut u32);
+    fn place_part(b: *const u8, from: usize, to: usize, base: u64, keys: *mut u64, spans: *mut u64, start: *const u32, cursor: *mut u16, lat: *mut u32);
+}
+
 /// The whole file, read-only. /data is already in the page cache, so this costs no memory.
 fn map(path: &str) -> &'static [u8] {
     let f = File::open(path).unwrap();
@@ -53,105 +60,38 @@ fn hour_text(hour: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{:02}:00:00Z", hour % 24)
 }
 
-/// The 8 bytes at b[i..] as a word, and how many come before its first space (8 if none): the
-/// first space is the first zero byte after an xor with spaces.
-fn word(b: &[u8], i: usize) -> (u64, usize) {
-    let w = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-    let x = w ^ 0x2020_2020_2020_2020;
-    let space = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
-    (w, if space == 0 { 8 } else { space.trailing_zeros() as usize / 8 })
-}
-
-/// Endpoints, interned into one lock-free open-addressing table shared by all threads. A slot
-/// holds the endpoint's 64-bit hash, which identifies it among the 1,842 (a collision is about
-/// 1 in 10^13), and `at` holds offset << 8 | length of one occurrence in the file.
-struct Endpoints<'a> {
-    b: &'a [u8],
-    slots: Vec<AtomicU64>,
-    at: Vec<AtomicU64>,
-}
-
-impl Endpoints<'_> {
-    fn id(&self, at: usize, len: usize, hash: u64) -> usize {
-        let (key, mut s) = (hash | 1, (hash.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 52) as usize);
-        loop {
-            match self.slots[s].load(Relaxed) {
-                v if v == key => return s,
-                0 => match self.slots[s].compare_exchange(0, key, Relaxed, Relaxed) {
-                    Ok(_) => {
-                        self.at[s].store((at as u64) << 8 | len as u64, Relaxed);
-                        return s;
-                    }
-                    Err(v) if v == key => return s,
-                    Err(_) => {}
-                },
-                _ => s = (s + 1) % SLOTS,
-            }
-        }
-    }
-
-    /// Calls f(group, latency, is_5xx) for every line in b[from..to]; group = slot * HOURS + hour.
-    fn each(&self, from: usize, to: usize, base: u64, mut f: impl FnMut(usize, u32, bool)) {
-        // Bytes 5..13 of a timestamp are "MM-DDTHH": one word that changes only with the hour.
-        let (b, mut i, mut stamp, mut h) = (self.b, from, 0, 0);
-        while i < to {
-            let w = u64::from_le_bytes(b[i + 5..i + 13].try_into().unwrap());
-            if w != stamp {
-                stamp = w;
-                h = (day(&b[i..]) * 24 + num(&b[i + 11..i + 13]) - base) as usize;
-            }
-            // The method (3 to 7 bytes), then the endpoint, 8 bytes at a time. At least " 200 0\n"
-            // follows the endpoint, so every 8-byte read is in bounds.
-            let at = i + 29 + word(b, i + 28).1;
-            let (mut j, mut hash) = (at, 0u64);
-            loop {
-                let (w, n) = word(b, j);
-                let keep = if n == 8 { u64::MAX } else { (1 << (8 * n)) - 1 };
-                hash = (hash ^ w & keep).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(23);
-                j += n;
-                if n < 8 {
-                    break;
-                }
-            }
-            let g = self.id(at, j - at, hash) * HOURS + h;
-            let (error, mut lat) = (b[j + 1] == b'5', 0u32);
-            j += 5;
-            while b[j] != b'\n' {
-                lat = lat * 10 + (b[j] - b'0') as u32;
-                j += 1;
-            }
-            f(g, lat, error);
-            i = j + 1;
-        }
-    }
-}
-
 fn main() {
     let b = map("/data/requests.log");
-    let new = || (0..SLOTS).map(|_| AtomicU64::new(0)).collect();
-    let ep = Endpoints { b, slots: new(), at: new() };
+    let keys: Vec<AtomicU64> = (0..SLOTS).map(|_| AtomicU64::new(0)).collect();
+    let spans: Vec<AtomicU64> = (0..SLOTS).map(|_| AtomicU64::new(0)).collect();
     let base = day(b"2026-10-30") * 24 + 18;
     let k = thread::available_parallelism().map_or(1, |x| x.get());
     let next = |p: usize| p + b[p..].iter().position(|&c| c == b'\n').map_or(b.len() - p, |x| x + 1);
     let mut cut: Vec<usize> = (0..k).map(|j| b.len() * j / k).map(|p| if p == 0 { 0 } else { next(p) }).collect();
     cut.push(b.len());
 
-    // Pass 1: each thread counts its requests per group, so every thread's offset in each group's run
+    // Pass 1, in C++: each part counts its requests per group, so every part's offset in each group's run
     // is known before any latency is stored. 5xx responses go to one shared table, since they are rare.
     let errors: Vec<AtomicU32> = zeroed(SLOTS * HOURS);
     let counts: Vec<Vec<u16>> = thread::scope(|s| {
         let hs: Vec<_> = cut
             .windows(2)
             .map(|w| {
-                let (ep, errors) = (&ep, &errors);
+                let (keys, spans, errors) = (&keys, &spans, &errors);
                 s.spawn(move || {
                     let mut count = vec![0u16; SLOTS * HOURS];
-                    ep.each(w[0], w[1], base, |g, _, error| {
-                        count[g] += 1;
-                        if error {
-                            errors[g].fetch_add(1, Relaxed);
-                        }
-                    });
+                    unsafe {
+                        count_part(
+                            b.as_ptr(),
+                            w[0],
+                            w[1],
+                            base,
+                            keys.as_ptr() as *mut u64,
+                            spans.as_ptr() as *mut u64,
+                            count.as_mut_ptr(),
+                            errors.as_ptr() as *mut u32,
+                        )
+                    };
                     count
                 })
             })
@@ -161,9 +101,9 @@ fn main() {
 
     // Endpoints in byte order.
     let mut eps: Vec<(&[u8], usize)> = (0..SLOTS)
-        .filter(|&s| ep.slots[s].load(Relaxed) != 0)
+        .filter(|&s| keys[s].load(Relaxed) != 0)
         .map(|s| {
-            let v = ep.at[s].load(Relaxed);
+            let v = spans[s].load(Relaxed);
             (&b[(v >> 8) as usize..][..(v & 0xff) as usize], s)
         })
         .collect();
@@ -174,7 +114,7 @@ fn main() {
     // set in memory order, and the runs are placed afterwards.
     let (mut start, mut end) = (vec![0u32; SLOTS * HOURS], vec![0u32; SLOTS * HOURS]);
     let mut cursors = counts;
-    for g in (0..SLOTS * HOURS).filter(|&g| ep.slots[g / HOURS].load(Relaxed) != 0) {
+    for g in (0..SLOTS * HOURS).filter(|&g| keys[g / HOURS].load(Relaxed) != 0) {
         let mut size = 0;
         for c in cursors.iter_mut() {
             (c[g], size) = (size, size + c[g]);
@@ -187,15 +127,23 @@ fn main() {
     }
     let lat = zeroed(at as usize);
 
-    // Pass 2: the same parse again, storing each latency at its group's run, at the thread's cursor.
+    // Pass 2, in C++: each part is scanned again, and its latencies go to their groups' runs, at the
+    // part's cursors.
     thread::scope(|s| {
         for (mut cur, w) in cursors.into_iter().zip(cut.windows(2)) {
-            let (ep, lat, start) = (&ep, &lat, &start);
-            s.spawn(move || {
-                ep.each(w[0], w[1], base, |g, l, _| {
-                    lat[(start[g] + cur[g] as u32) as usize].store(l, Relaxed);
-                    cur[g] += 1;
-                });
+            let (keys, spans, start, lat) = (&keys, &spans, &start, &lat);
+            s.spawn(move || unsafe {
+                place_part(
+                    b.as_ptr(),
+                    w[0],
+                    w[1],
+                    base,
+                    keys.as_ptr() as *mut u64,
+                    spans.as_ptr() as *mut u64,
+                    start.as_ptr(),
+                    cur.as_mut_ptr(),
+                    lat.as_ptr() as *mut u32,
+                )
             });
         }
     });
