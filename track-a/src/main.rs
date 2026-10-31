@@ -217,13 +217,20 @@ fn main() {
                             }
                             v.clear();
                             v.extend(lat[from..to].iter().map(|x| x.load(Relaxed)));
-                            v.sort_unstable();
-                            let pct = |p: usize| v[(p * n + 99) / 100 - 1];
+                            // Nearest rank for p50, p95, p99: select each in turn, every rank
+                            // searched only in the part right of the previous one.
+                            let mut pct = [0u32; 3];
+                            let mut lo = 0;
+                            for (x, p) in pct.iter_mut().zip([50, 95, 99]) {
+                                let r = (p * n + 99) / 100 - 1;
+                                *x = *v[lo..].select_nth_unstable(r - lo).1;
+                                lo = r;
+                            }
                             let e = errors[g].load(Relaxed) as usize;
                             out.extend_from_slice(text.as_bytes());
                             out.push(b' ');
                             out.extend_from_slice(name);
-                            writeln!(out, " {n} {} {} {} {e} {}", pct(50), pct(95), pct(99), e * 1_000_000 / n).unwrap();
+                            writeln!(out, " {n} {} {} {} {e} {}", pct[0], pct[1], pct[2], e * 1_000_000 / n).unwrap();
                         }
                     }
                     out
