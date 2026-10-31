@@ -1,15 +1,17 @@
-// Track A's line scanner, in C++. The Rust driver calls it once per part of the file: count_part counts
-// each group's requests (pass 1), and place_part stores each latency in its group's run (pass 2). Both
-// scan the lines the same way and intern endpoints in the same table, so the passes agree on every group.
+// Track A's line scanner, in C++. The Rust driver calls scan_part once per part of the file, in parallel. Each line
+// becomes one record in its hour's stream for that part: its latency, and its endpoint's slot with 0x8000 set when
+// the status is 5xx.
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 namespace {
 
 constexpr size_t HOURS = 72;
 constexpr size_t SLOTS = 4096;
+constexpr uint32_t CHUNK = 256;  // records per chunk
 constexpr uint64_t K = 0x9e3779b97f4a7c15ull;
 
 uint64_t load64(const uint8_t* p) {
@@ -60,7 +62,7 @@ size_t intern(std::atomic<uint64_t>* keys, std::atomic<uint64_t>* spans, size_t 
     }
 }
 
-// Calls f(group, latency, is_5xx) for every line in b[from..to]; group = slot * HOURS + hour.
+// Calls f(hour, slot, latency, is_5xx) for every line in b[from..to].
 template <class F>
 void scan(const uint8_t* b, size_t from, size_t to, uint64_t base, std::atomic<uint64_t>* keys,
           std::atomic<uint64_t>* spans, F f) {
@@ -86,7 +88,7 @@ void scan(const uint8_t* b, size_t from, size_t to, uint64_t base, std::atomic<u
             j += n;
             if (n < 8) break;
         }
-        size_t g = intern(keys, spans, at, j - at, hash) * HOURS + h;
+        size_t s = intern(keys, spans, at, j - at, hash);
         bool error = b[j + 1] == '5';
         j += 5;
         uint32_t lat = 0;
@@ -94,29 +96,48 @@ void scan(const uint8_t* b, size_t from, size_t to, uint64_t base, std::atomic<u
             lat = lat * 10 + static_cast<uint32_t>(b[j] - '0');
             ++j;
         }
-        f(g, lat, error);
+        f(h, s, lat, error);
         i = j + 1;
     }
 }
 
 }  // namespace
 
-extern "C" {
+// One part's records for one hour: a linked list of chunks, in arrival order.
+struct Chunk {
+    Chunk* next;
+    uint32_t n;
+    uint32_t lat[CHUNK];
+    uint16_t slot[CHUNK];  // the endpoint's slot, with 0x8000 set for a 5xx
+};
 
-void count_part(const uint8_t* b, size_t from, size_t to, uint64_t base, std::atomic<uint64_t>* keys,
-                std::atomic<uint64_t>* spans, uint16_t* count, std::atomic<uint32_t>* errors) {
-    scan(b, from, to, base, keys, spans, [&](size_t g, uint32_t, bool error) {
-        count[g] += 1;
-        if (error) errors[g].fetch_add(1, std::memory_order_relaxed);
-    });
+struct Stream {
+    Chunk* head;
+    Chunk* tail;
+};
+
+namespace {
+
+void append(Stream& s, uint32_t lat, uint16_t slot) {
+    if (!s.tail || s.tail->n == CHUNK) {
+        Chunk* c = static_cast<Chunk*>(std::malloc(sizeof(Chunk)));
+        c->next = nullptr;
+        c->n = 0;
+        if (s.tail) s.tail->next = c; else s.head = c;
+        s.tail = c;
+    }
+    s.tail->lat[s.tail->n] = lat;
+    s.tail->slot[s.tail->n++] = slot;
 }
 
-void place_part(const uint8_t* b, size_t from, size_t to, uint64_t base, std::atomic<uint64_t>* keys,
-                std::atomic<uint64_t>* spans, const uint32_t* start, uint16_t* cursor,
-                std::atomic<uint32_t>* lat) {
-    scan(b, from, to, base, keys, spans, [&](size_t g, uint32_t l, bool) {
-        lat[start[g] + cursor[g]].store(l, std::memory_order_relaxed);
-        cursor[g] += 1;
+}  // namespace
+
+extern "C" {
+
+void scan_part(const uint8_t* b, size_t from, size_t to, uint64_t base, std::atomic<uint64_t>* keys,
+               std::atomic<uint64_t>* spans, Stream* streams) {
+    scan(b, from, to, base, keys, spans, [&](size_t h, size_t s, uint32_t lat, bool error) {
+        append(streams[h], lat, static_cast<uint16_t>(s | (error ? 0x8000 : 0)));
     });
 }
 

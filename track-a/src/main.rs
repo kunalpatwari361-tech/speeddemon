@@ -1,19 +1,55 @@
+use std::ffi::c_void;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::ptr;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
-    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    fn free(p: *mut c_void);
 }
 
 // The line scanner, in C++ (native/scan.cpp), built into native/libscan.a by the Dockerfile.
 #[link(name = "scan", kind = "static")]
 extern "C" {
-    fn count_part(b: *const u8, from: usize, to: usize, base: u64, keys: *mut u64, spans: *mut u64, count: *mut u16, errors: *mut u32);
-    fn place_part(b: *const u8, from: usize, to: usize, base: u64, keys: *mut u64, spans: *mut u64, start: *const u32, cursor: *mut u16, lat: *mut u32);
+    fn scan_part(
+        b: *const u8,
+        from: usize,
+        to: usize,
+        base: u64,
+        keys: *mut u64,
+        spans: *mut u64,
+        streams: *mut Stream,
+    );
+}
+
+const HOURS: usize = 72; // the span is fixed: 2026-10-30T18:00Z to 2026-11-02T18:00Z
+const SLOTS: usize = 4096; // the endpoint catalogue is 1,842 templates
+const CHUNK: usize = 256; // records per chunk, as in scan.cpp
+const ERROR: u16 = 0x8000; // set in a record's slot for a 5xx status
+
+/// One part's records for one hour, as a linked list of chunks. Matches scan.cpp.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Stream {
+    head: *mut Chunk,
+    tail: *mut Chunk,
+}
+
+// A part's chunks are written by its one thread, which is joined before any chunk is read,
+// and are only read after that.
+unsafe impl Send for Stream {}
+unsafe impl Sync for Stream {}
+
+/// Up to CHUNK records of one stream, in arrival order.
+#[repr(C)]
+struct Chunk {
+    next: *mut Chunk,
+    n: u32,
+    lat: [u32; CHUNK],
+    slot: [u16; CHUNK],
 }
 
 /// The whole file, read-only. /data is already in the page cache, so this costs no memory.
@@ -23,18 +59,10 @@ fn map(path: &str) -> &'static [u8] {
     if len == 0 {
         return &[];
     }
-    unsafe { std::slice::from_raw_parts(mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0), len) }
+    unsafe {
+        std::slice::from_raw_parts(mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0), len)
+    }
 }
-
-/// Zeroed counters whose pages the kernel supplies only when first touched.
-fn zeroed(n: usize) -> Vec<AtomicU32> {
-    unsafe { std::mem::transmute::<Vec<u32>, Vec<AtomicU32>>(vec![0u32; n]) }
-}
-
-const HOURS: usize = 72; // the span is fixed: 2026-10-30T18:00Z to 2026-11-02T18:00Z
-const SLOTS: usize = 4096; // the endpoint catalogue is 1,842 templates
-const PAGE: usize = 4096;
-const MADV_DONTNEED: i32 = 4;
 
 fn num(b: &[u8]) -> u64 {
     b.iter().fold(0, |v, &c| v * 10 + (c - b'0') as u64)
@@ -55,9 +83,54 @@ fn hour_text(hour: u64) -> String {
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
-    let (d, m) = (doy - (153 * mp + 2) / 5 + 1, if mp < 10 { mp + 3 } else { mp - 9 });
+    let (d, m) = (
+        doy - (153 * mp + 2) / 5 + 1,
+        if mp < 10 { mp + 3 } else { mp - 9 },
+    );
     let y = z / 146_097 * 400 + yoe + (m <= 2) as u64;
     format!("{y:04}-{m:02}-{d:02}T{:02}:00:00Z", hour % 24)
+}
+
+/// Calls f(slot, latency) for every record of hour h, part by part. A 5xx record has ERROR set in its slot.
+fn records(parts: &[[Stream; HOURS]], h: usize, mut f: impl FnMut(u16, u32)) {
+    for p in parts {
+        let mut c = p[h].head;
+        while !c.is_null() {
+            let ch = unsafe { &*c };
+            let n = ch.n as usize;
+            for (&s, &l) in ch.slot[..n].iter().zip(&ch.lat[..n]) {
+                f(s, l);
+            }
+            c = ch.next;
+        }
+    }
+}
+
+/// Appends v in decimal.
+fn push_num(out: &mut Vec<u8>, mut v: usize) {
+    let mut digits = [0u8; 20];
+    let mut i = digits.len();
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&digits[i..]);
+}
+
+/// Frees one hour's chunks in every part.
+fn free_hour(parts: &[[Stream; HOURS]], h: usize) {
+    for p in parts {
+        let mut c = p[h].head;
+        while !c.is_null() {
+            let next = unsafe { (*c).next };
+            unsafe { free(c.cast()) };
+            c = next;
+        }
+    }
 }
 
 fn main() {
@@ -66,33 +139,42 @@ fn main() {
     let spans: Vec<AtomicU64> = (0..SLOTS).map(|_| AtomicU64::new(0)).collect();
     let base = day(b"2026-10-30") * 24 + 18;
     let k = thread::available_parallelism().map_or(1, |x| x.get());
-    let next = |p: usize| p + b[p..].iter().position(|&c| c == b'\n').map_or(b.len() - p, |x| x + 1);
-    let mut cut: Vec<usize> = (0..k).map(|j| b.len() * j / k).map(|p| if p == 0 { 0 } else { next(p) }).collect();
+    let next = |p: usize| {
+        p + b[p..]
+            .iter()
+            .position(|&c| c == b'\n')
+            .map_or(b.len() - p, |x| x + 1)
+    };
+    let mut cut: Vec<usize> = (0..k)
+        .map(|j| b.len() * j / k)
+        .map(|p| if p == 0 { 0 } else { next(p) })
+        .collect();
     cut.push(b.len());
 
-    // Pass 1, in C++: each part counts its requests per group, so every part's offset in each group's run
-    // is known before any latency is stored. 5xx responses go to one shared table, since they are rare.
-    let errors: Vec<AtomicU32> = zeroed(SLOTS * HOURS);
-    let counts: Vec<Vec<u16>> = thread::scope(|s| {
+    // The file is scanned once, in C++: each part appends its lines to its hours' streams. Lines are not in
+    // time order, so an hour's records come from every part.
+    let parts: Vec<[Stream; HOURS]> = thread::scope(|s| {
         let hs: Vec<_> = cut
             .windows(2)
             .map(|w| {
-                let (keys, spans, errors) = (&keys, &spans, &errors);
+                let (keys, spans) = (&keys, &spans);
                 s.spawn(move || {
-                    let mut count = vec![0u16; SLOTS * HOURS];
+                    let mut streams = [Stream {
+                        head: ptr::null_mut(),
+                        tail: ptr::null_mut(),
+                    }; HOURS];
                     unsafe {
-                        count_part(
+                        scan_part(
                             b.as_ptr(),
                             w[0],
                             w[1],
                             base,
                             keys.as_ptr() as *mut u64,
                             spans.as_ptr() as *mut u64,
-                            count.as_mut_ptr(),
-                            errors.as_ptr() as *mut u32,
+                            streams.as_mut_ptr(),
                         )
                     };
-                    count
+                    streams
                 })
             })
             .collect();
@@ -109,84 +191,72 @@ fn main() {
         .collect();
     eps.sort_unstable();
 
-    // Every group's latencies get one run of a flat array, laid out in output order; each thread
-    // fills its own part of every run, its count becoming its cursor within the run. Cursors are
-    // set in memory order, and the runs are placed afterwards.
-    let (mut start, mut end) = (vec![0u32; SLOTS * HOURS], vec![0u32; SLOTS * HOURS]);
-    let mut cursors = counts;
-    for g in (0..SLOTS * HOURS).filter(|&g| keys[g / HOURS].load(Relaxed) != 0) {
-        let mut size = 0;
-        for c in cursors.iter_mut() {
-            (c[g], size) = (size, size + c[g]);
-        }
-        end[g] = size as u32;
-    }
-    let mut at = 0;
-    for g in (0..HOURS).flat_map(|h| eps.iter().map(move |&(_, s)| s * HOURS + h)) {
-        (start[g], end[g], at) = (at, at + end[g], at + end[g]);
-    }
-    let lat = zeroed(at as usize);
-
-    // Pass 2, in C++: each part is scanned again, and its latencies go to their groups' runs, at the
-    // part's cursors.
-    thread::scope(|s| {
-        for (mut cur, w) in cursors.into_iter().zip(cut.windows(2)) {
-            let (keys, spans, start, lat) = (&keys, &spans, &start, &lat);
-            s.spawn(move || unsafe {
-                place_part(
-                    b.as_ptr(),
-                    w[0],
-                    w[1],
-                    base,
-                    keys.as_ptr() as *mut u64,
-                    spans.as_ptr() as *mut u64,
-                    start.as_ptr(),
-                    cur.as_mut_ptr(),
-                    lat.as_ptr() as *mut u32,
-                )
-            });
-        }
-    });
-
     // Hours go to whichever thread is free, and are written in hour order as they finish. An hour's
-    // runs are contiguous in lat, so once it is formatted its whole pages go back to the system.
+    // latencies are gathered by endpoint into one buffer, which stays in cache.
     let mut file = File::create("/out/summary.txt").unwrap();
     let next_hour = AtomicUsize::new(0);
     thread::scope(|s| {
         let (tx, rx) = std::sync::mpsc::channel();
         for _ in 0..k {
-            let (tx, eps, start, end, lat, errors, next_hour) = (tx.clone(), &eps, &start, &end, &lat, &errors, &next_hour);
+            let (tx, eps, parts, next_hour) = (tx.clone(), &eps, &parts, &next_hour);
             s.spawn(move || {
-                let (mut v, lat_addr) = (Vec::new(), lat.as_ptr() as usize);
+                let (mut count, mut errors, mut at, mut lat) = (
+                    vec![0u32; SLOTS],
+                    vec![0u32; SLOTS],
+                    vec![0usize; SLOTS],
+                    Vec::new(),
+                );
                 loop {
                     let h = next_hour.fetch_add(1, Relaxed);
                     if h >= HOURS {
                         break;
                     }
-                    let (text, mut out) = (hour_text(base + h as u64), Vec::new());
-                    for &(name, slot) in eps {
-                        let g = slot * HOURS + h;
-                        let (from, to) = (start[g] as usize, end[g] as usize);
-                        let n = to - from;
+                    count.fill(0);
+                    errors.fill(0);
+                    records(parts, h, |s, _| {
+                        let slot = (s & !ERROR) as usize;
+                        count[slot] += 1;
+                        errors[slot] += ((s & ERROR) != 0) as u32;
+                    });
+                    let mut total = 0;
+                    for &(_, s) in eps {
+                        at[s] = total;
+                        total += count[s] as usize;
+                    }
+                    lat.resize(total, 0);
+                    records(parts, h, |s, l| {
+                        let s = (s & !ERROR) as usize;
+                        lat[at[s]] = l;
+                        at[s] += 1;
+                    });
+                    let text = hour_text(base + h as u64);
+                    let mut out = Vec::new();
+                    for &(name, s) in eps {
+                        let n = count[s] as usize;
                         if n == 0 {
                             continue;
                         }
-                        v.clear();
-                        v.extend(lat[from..to].iter().map(|x| x.load(Relaxed)));
-                        v.sort_unstable();
-                        let pct = |p: usize| v[(p * n + 99) / 100 - 1];
-                        let e = errors[g].load(Relaxed) as usize;
+                        lat[at[s] - n..at[s]].sort_unstable();
+                        let run = &lat[at[s] - n..at[s]];
+                        let pct = |p: usize| run[(p * n + 99) / 100 - 1];
+                        let e = errors[s] as usize;
                         out.extend_from_slice(text.as_bytes());
                         out.push(b' ');
                         out.extend_from_slice(name);
-                        writeln!(out, " {n} {} {} {} {e} {}", pct(50), pct(95), pct(99), e * 1_000_000 / n).unwrap();
+                        for x in [
+                            n,
+                            pct(50) as usize,
+                            pct(95) as usize,
+                            pct(99) as usize,
+                            e,
+                            e * 1_000_000 / n,
+                        ] {
+                            out.push(b' ');
+                            push_num(&mut out, x);
+                        }
+                        out.push(b'\n');
                     }
-                    let (first, last) = (eps[0].1 * HOURS + h, eps[eps.len() - 1].1 * HOURS + h);
-                    let (lo, hi) = (lat_addr + start[first] as usize * 4, lat_addr + end[last] as usize * 4);
-                    let (from, to) = ((lo + PAGE - 1) & !(PAGE - 1), hi & !(PAGE - 1));
-                    if to > from {
-                        unsafe { madvise(from as *mut u8, to - from, MADV_DONTNEED) };
-                    }
+                    free_hour(parts, h);
                     tx.send((h, out)).unwrap();
                 }
             });

@@ -4,15 +4,15 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-Rust, standard library only. The log is memory-mapped; `/data` is already in the page cache, so reading costs no copy and no memory.
+The scanner is C++ (`native/scan.cpp`); the rest is Rust with its standard library only. The log is memory-mapped; `/data` is already in the page cache, so reading costs no copy and no memory.
 
-The file is split into one part per hardware thread, at line boundaries. Each line is parsed in place without decoding. The hour comes from the timestamp's digits with integer calendar arithmetic, and is only recomputed when the 8 bytes "MM-DDTHH", read as one word, differ from the line before. The method and the endpoint are read 8 bytes at a time: a word's first space shows up as its first zero byte after an xor with spaces, and each word is mixed into the endpoint's hash. The latency and status are read straight from their digits.
+The file is split into one part per hardware thread, at line boundaries. Each line is parsed in place without decoding. The hour comes from the timestamp's digits with integer calendar arithmetic, and is only recomputed when the 8 bytes "MM-DDTHH", read as one word, differ from the line before. The method and the endpoint are read 8 bytes at a time: a word's first space shows up as its first zero byte after an xor with spaces, and each word is mixed into the endpoint's hash. The latency is read straight from its digits, and a status only needs its first digit to tell a 5xx.
 
 Endpoints are interned into one lock-free open-addressing table shared by all threads. A slot holds where the endpoint first occurs in the file, so no string is ever copied. A group is (endpoint slot, hour), and the span is fixed at 72 hours.
 
-The file is parsed once. Each thread counts its requests per group in 2 bytes each and keeps a compact (group, latency) record per line, in 512 KB chunks that are freed as soon as they are placed, so the records and the latency array never coexist whole; 5xx responses go to a shared counter, since they are rare. The counts become, for each thread, its own offset into every group's run of one flat latency array, and each thread then places its records straight into it, with no merging afterwards.
+The file is scanned once. Each line becomes one 6-byte record, its latency and its endpoint's slot with a bit for 5xx, appended to the chunk list of its hour in its part. A chunk holds 256 records, so a part's records for an hour are never copied or reallocated.
 
-Endpoints are sorted by byte. Hours are split across threads, and each formats its hours' lines in order, sorting each group's run once to read the nearest-rank percentiles. The buffers are written in order.
+Endpoints are sorted by byte. Hours are then processed in parallel, in any order, since the log is not in time order. For an hour, one pass over its records counts each endpoint's requests and 5xx responses, and a second pass places each latency in its endpoint's run of one buffer that stays in cache. Each run is sorted once to read the nearest-rank percentiles. The hours' lines are written in hour order as they finish, and an hour's chunks are freed when it is done.
 
 The binary is built for the scoring CPU (`target-cpu=native`).
 
@@ -22,4 +22,4 @@ None.
 
 ## With another 24 hours
 
-Word-at-a-time endpoint scanning, and selecting the three percentiles instead of sorting.
+Smaller records, since their 6 bytes each are most of the peak memory, and selecting the three percentiles instead of sorting.
