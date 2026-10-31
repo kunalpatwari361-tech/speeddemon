@@ -26,3 +26,5 @@ Measured on a laptop (Intel Core i5-1335U: 2 performance and 8 efficiency cores,
 Code lines (rustfmt, then scc, as the board counts them): 420 at step 1, 468 with the kept changes.
 
 On the board the memory fell as measured here, but the time did not: the laptop put the three changes of step 3 at about 22% faster, and the board measured 0.4271 s before them and 0.4309 s after. The same unchanged Track D code has measured from 0.381 s to 0.448 s on the board, so a few percent either way is within its noise.
+
+Memory, later: no transparent huge pages (prctl); every query's steps in one list, a phrase's words re-read from queries.txt; 16-bit places in a round's runs (more rounds if one would hold 2^16 documents); 32-bit bitset indexes; only each document's end kept; term and pair tables compacted after parsing. Laptop, 10 paired runs: peak 44 to 45 MB before, 32 to 33 MB after, in every run; median 568 to 557 ms, faster in 6/10.

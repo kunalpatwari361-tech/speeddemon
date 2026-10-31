@@ -6,7 +6,10 @@ use std::thread;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
 }
+
+const PR_SET_THP_DISABLE: i32 = 41;
 
 /// The whole file, read-only. /data is already in the page cache, so this costs no memory.
 /// n zeroed values (all-zero bytes are valid for these atomics), whose pages the kernel supplies
@@ -68,6 +71,17 @@ impl Table {
             (self.slots[s], self.len) = ((key, self.len, u32::MAX), self.len + 1);
         }
         self.slots[s].1
+    }
+    /// The same map in a table about two thirds full at most, the smallest a lookup stays short in.
+    fn compact(&self) -> Table {
+        let mut t = Table::new(self.len as usize * 3 / 2 + 1);
+        t.filter.clone_from(&self.filter);
+        for &s in self.slots.iter().filter(|s| s.0 != 0) {
+            let i = t.slot(s.0);
+            t.slots[i] = s;
+        }
+        t.len = self.len;
+        t
     }
 }
 
@@ -161,8 +175,8 @@ impl Index<'_> {
     /// Calls f(doc, id, bitset index) for the query terms and phrase pairs in each document: once
     /// per document for an id without a bitset (index u32::MAX), at every occurrence for one with a
     /// bitset, since setting its bit again does nothing. Pair ids follow the term ids. Also records
-    /// where each document's text lies.
-    fn scan(&self, from: usize, to: usize, span: &[AtomicU64], mut f: impl FnMut(u32, u32, u32)) {
+    /// where each document's line ends.
+    fn scan(&self, from: usize, to: usize, end: &[AtomicU32], mut f: impl FnMut(u32, u32, u32)) {
         let (b, nt) = (self.docs, self.terms.len);
         // seen[id % 4096] is doc + 1 once an id with those low bits is reported for the document;
         // the document's reported ids settle whether it was this one.
@@ -205,7 +219,7 @@ impl Index<'_> {
                 }
                 prev = cur.map(|(c, _)| c);
             }
-            span[doc as usize].store((tab as u64 + 1) << 32 | j as u64, Relaxed);
+            end[doc as usize].store(j as u32, Relaxed);
             i = j + 1;
         }
     }
@@ -271,79 +285,97 @@ fn eval<'a>(steps: impl Iterator<Item = (u8, Set<'a>)>, r: &mut [u64], v: &mut V
 const ROUNDS: usize = 8;
 
 fn main() {
+    // No transparent huge pages: one would back a mostly untouched stretch of a lazily filled array,
+    // and a freed buffer's huge pages stay counted until they are split.
+    unsafe { prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) };
     let (docs, q) = (map("/data/docs.txt"), map("/data/queries.txt"));
 
-    // Every query becomes (operator, id) steps: a BOOL's terms as written, a PHRASE's adjacent pairs
-    // ANDed (a pair id has the top bit set). A PHRASE also keeps its words, to check longer ones.
+    // Every query becomes (operator, id) steps, all in one list: a BOOL's terms as written, a PHRASE's
+    // adjacent pairs ANDed (a pair id has the top bit set). A query is its range of steps and, for a
+    // PHRASE, where its words lie in queries.txt, to check longer ones.
     let lines = || q.split(|&c| c == b'\n').filter(|l| !l.is_empty());
     let spaces = |l: &[u8]| l.iter().filter(|&&c| c == b' ').count() + 1;
     let phrases = lines().filter(|l| l.starts_with(b"PHRASE")).map(spaces).sum();
     let (mut terms, mut pairs) = (Table::new(spaces(q)), Table::new(phrases));
-    let mut queries = Vec::new();
+    let (mut steps, mut queries) = (Vec::with_capacity(spaces(q)), Vec::new());
     for line in lines() {
         let phrase = line.starts_with(b"PHRASE");
         let rest = if phrase { &line[8..line.len() - 1] } else { &line[5..] };
-        let words: Vec<&[u8]> = rest.split(|&c| c == b' ').collect();
-        let mut id = |w: &[u8]| terms.add(token(w, 0).1 | 1);
-        let steps: Vec<(u8, u32)> = if phrase {
-            let ids: Vec<u32> = words.iter().map(|w| id(w)).collect();
-            let pair_ids = ids.windows(2).map(|p| pairs.add(pair(p[0], p[1])) | 1 << 31);
-            pair_ids.enumerate().map(|(j, p)| (if j == 0 { b'=' } else { b'A' }, p)).collect()
-        } else {
-            let ops = std::iter::once(b'=').chain(words.iter().skip(1).step_by(2).map(|o| o[0]));
-            ops.zip(words.iter().step_by(2)).map(|(op, w)| (op, id(w))).collect()
-        };
-        queries.push((steps, if phrase { words } else { Vec::new() }));
+        let (from, mut op, mut prev) = (steps.len() as u32, b'=', None);
+        for (j, w) in rest.split(|&c| c == b' ').enumerate() {
+            if phrase {
+                let c = terms.add(token(w, 0).1 | 1);
+                if let Some(p) = prev {
+                    (_, op) = (steps.push((op, pairs.add(pair(p, c)) | 1 << 31)), b'A');
+                }
+                prev = Some(c);
+            } else if j % 2 == 1 {
+                op = w[0];
+            } else {
+                steps.push((op, terms.add(token(w, 0).1 | 1)));
+            }
+        }
+        let at = if phrase { (rest.as_ptr() as usize - q.as_ptr() as usize) as u32 } else { 0 };
+        queries.push([from, steps.len() as u32, at, at + phrase as u32 * rest.len() as u32]);
     }
 
-    let mut index = Index { docs, terms, pairs };
+    let mut index = Index { docs, terms: terms.compact(), pairs: pairs.compact() };
+    drop((terms, pairs));
     let ids = (index.terms.len + index.pairs.len) as usize;
     let n = docs.rsplit(|&c| c == b'\n').nth(1).map_or(0, |last| num(last) + 1); // the last id + 1
-    let span: Vec<AtomicU64> = zeroed(n);
+    let end: Vec<AtomicU32> = zeroed(n);
     let k = thread::available_parallelism().map_or(1, |x| x.get());
 
-    // The documents go in ROUNDS rounds of k blocks, one block per thread. A round's postings are
-    // built, queried and freed before the next round starts.
-    let blocks = cuts(docs, k * ROUNDS);
-    let first = |b: usize| if blocks[b] < docs.len() { num(&docs[blocks[b]..]) } else { n };
+    // The documents go in rounds of k blocks, one block per thread. A round's postings are built,
+    // queried and freed before the next round starts. There are at least ROUNDS rounds, and more if
+    // a round would hold 2^16 documents, so a thread's place in a round's run fits 16 bits.
+    let first = |blocks: &[usize], b: usize| if blocks[b] < docs.len() { num(&docs[blocks[b]..]) } else { n };
+    let mut rounds = ROUNDS;
+    let blocks = loop {
+        let blocks = cuts(docs, k * rounds);
+        if (0..rounds).all(|r| first(&blocks, r * k + k) - first(&blocks, r * k) < 1 << 16) {
+            break blocks;
+        }
+        rounds *= 2;
+    };
 
     // A sample, the first thirty-second of every block, estimates which ids are common. Those get a
     // bitset over the round's documents, which the full pass sets directly.
     let sample = each(k, |j| {
         let mut count = vec![0u32; ids];
-        for b in (j..k * ROUNDS).step_by(k) {
-            index.scan(blocks[b], blocks[b] + (blocks[b + 1] - blocks[b]) / 32, &span, |_, id, _| count[id as usize] += 1);
+        for b in (j..k * rounds).step_by(k) {
+            index.scan(blocks[b], blocks[b] + (blocks[b + 1] - blocks[b]) / 32, &end, |_, id, _| count[id as usize] += 1);
         }
         count
     });
     let mut nbits = 0;
-    let bit_of: Vec<Option<usize>> = (0..ids)
-        .map(|id| (sample.iter().map(|s| s[id] as usize).sum::<usize>() * 32 * 32 >= n).then(|| (nbits, nbits += 1).0))
+    let bit_of: Vec<u32> = (0..ids)
+        .map(|id| if sample.iter().map(|s| s[id] as usize).sum::<usize>() * 32 * 32 >= n { (nbits, nbits += 1).0 } else { u32::MAX })
         .collect();
-    let rare: Vec<usize> = sample.iter().map(|s| (0..ids).filter(|&id| bit_of[id].is_none()).map(|id| s[id] as usize).sum()).collect();
+    let rare: Vec<usize> = sample.iter().map(|s| (0..ids).filter(|&id| bit_of[id] == u32::MAX).map(|id| s[id] as usize).sum()).collect();
     drop(sample);
     let nt = index.terms.len;
     for (t, base) in [(&mut index.terms, 0), (&mut index.pairs, nt)] {
         for s in t.slots.iter_mut().filter(|s| s.0 != 0) {
-            s.2 = bit_of[(base + s.1) as usize].map_or(u32::MAX, |b| b as u32);
+            s.2 = bit_of[(base + s.1) as usize];
         }
     }
 
     // Every query's count, id sum and first ten ids, built up round by round.
     let mut acc = vec![(0u64, 0u64, [0u32; 10]); queries.len()];
     let chunk = queries.len().div_ceil(k).max(1);
-    for round in 0..ROUNDS {
-        let (d0, d1) = (first(round * k), first(round * k + k));
+    for round in 0..rounds {
+        let (d0, d1) = (first(&blocks, round * k), first(&blocks, round * k + k));
         let words = (d1 - d0).div_ceil(64);
-        let bits: Vec<AtomicU64> = zeroed(nbits * words);
+        let bits: Vec<AtomicU64> = zeroed(nbits as usize * words);
 
         // The full pass: a common id sets its bit; every other id goes to the thread's stream, after
         // a marker (top bit set) naming the document, counted from the round's first. Then the
         // thread counts its stream's hits per id.
-        let (streams, mut counts): (Vec<Vec<u32>>, Vec<Vec<u32>>) = each(k, |j| {
+        let (streams, mut counts): (Vec<Vec<u32>>, Vec<Vec<u16>>) = each(k, |j| {
             let b = round * k + j;
-            let (mut stream, mut last) = (Vec::with_capacity(rare[j] * 33 / ROUNDS + first(b + 1) - first(b)), u32::MAX);
-            index.scan(blocks[b], blocks[b + 1], &span, |doc, id, dense| {
+            let (mut stream, mut last) = (Vec::with_capacity(rare[j] * 33 / rounds + first(&blocks, b + 1) - first(&blocks, b)), u32::MAX);
+            index.scan(blocks[b], blocks[b + 1], &end, |doc, id, dense| {
                 let doc = doc - d0 as u32;
                 if dense != u32::MAX {
                     let w = &bits[dense as usize * words + doc as usize / 64];
@@ -355,7 +387,7 @@ fn main() {
                     stream.push(id);
                 }
             });
-            let mut count = vec![0u32; ids];
+            let mut count = vec![0u16; ids];
             stream.iter().filter(|&&v| v >> 31 == 0).for_each(|&v| count[v as usize] += 1);
             (stream, count)
         })
@@ -363,27 +395,28 @@ fn main() {
         .unzip();
 
         // The other ids get a run of one flat array, and each thread places its stream into its own
-        // part of every run: its count of an id becomes its cursor in the id's run.
+        // part of every run: its count of an id becomes its place in the id's run.
         let mut start = vec![0u32; ids + 1];
         for id in 0..ids {
-            let mut at = start[id];
+            let mut at = 0;
             for c in counts.iter_mut() {
-                (c[id], at) = (at, at + c[id]);
+                (c[id], at) = (at as u16, at + c[id] as u32);
             }
-            start[id + 1] = at;
+            start[id + 1] = start[id] + at;
         }
         let flat: Vec<AtomicU32> = zeroed(start[ids] as usize);
         thread::scope(|s| {
             for (stream, mut cur) in streams.into_iter().zip(counts) {
-                let flat = &flat;
+                let (flat, start) = (&flat, &start);
                 s.spawn(move || {
                     let mut doc = 0;
                     for v in stream {
                         if v >> 31 == 1 {
                             doc = v & !(1 << 31);
                         } else {
-                            flat[cur[v as usize] as usize].store(doc, Relaxed);
-                            cur[v as usize] += 1;
+                            let v = v as usize;
+                            flat[(start[v] + cur[v] as u32) as usize].store(doc, Relaxed);
+                            cur[v] += 1;
                         }
                     }
                 });
@@ -394,25 +427,29 @@ fn main() {
         let set = |id: u32| {
             let id = if id >> 31 == 1 { (nt + (id & !(1 << 31))) as usize } else { id as usize };
             match bit_of[id] {
-                Some(b) => Set::Bits(&bits[b * words..][..words]),
-                None => Set::Ids(&flat[start[id] as usize..start[id + 1] as usize]),
+                u32::MAX => Set::Ids(&flat[start[id] as usize..start[id + 1] as usize]),
+                b => Set::Bits(&bits[b as usize * words..][..words]),
             }
         };
 
         // Answer the queries on the round's documents in k contiguous blocks of queries.
         thread::scope(|s| {
             for (block, acc) in queries.chunks(chunk).zip(acc.chunks_mut(chunk)) {
-                let (set, span) = (&set, &span);
+                let (set, end, steps) = (&set, &end, &steps);
                 s.spawn(move || {
-                    let (mut r, mut v) = (vec![0u64; words], Vec::new());
-                    for ((steps, phrase), (count, sum, ten)) in block.iter().zip(acc) {
-                        eval(steps.iter().map(|&(op, id)| (op, set(id))), &mut r, &mut v);
-                        if phrase.len() > 2 {
+                    let (mut r, mut v, mut phrase) = (vec![0u64; words], Vec::new(), Vec::new());
+                    for (&[from, to, at, stop], (count, sum, ten)) in block.iter().zip(acc) {
+                        eval(steps[from as usize..to as usize].iter().map(|&(op, id)| (op, set(id))), &mut r, &mut v);
+                        if to - from > 1 && stop > at {
                             // Every adjacent pair occurs; check the words occur together, in order.
+                            phrase.clear();
+                            phrase.extend(q[at as usize..stop as usize].split(|&c| c == b' '));
                             v.retain(|&d| {
-                                let sp = span[d0 + d as usize].load(Relaxed);
-                                let toks: Vec<&[u8]> = tokens(&docs[(sp >> 32) as usize..sp as u32 as usize]).collect();
-                                toks.windows(phrase.len()).any(|w| w.iter().zip(phrase).all(|(a, b)| a.eq_ignore_ascii_case(b)))
+                                let d = d0 + d as usize;
+                                let line = if d == 0 { 0 } else { end[d - 1].load(Relaxed) as usize + 1 };
+                                let tab = line + docs[line..].iter().position(|&c| c == b'\t').unwrap();
+                                let toks: Vec<&[u8]> = tokens(&docs[tab + 1..end[d].load(Relaxed) as usize]).collect();
+                                toks.windows(phrase.len()).any(|w| w.iter().zip(&phrase).all(|(a, b)| a.eq_ignore_ascii_case(b)))
                             });
                         }
                         let have = (*count).min(10) as usize;
