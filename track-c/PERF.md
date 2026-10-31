@@ -22,3 +22,5 @@ Where step 1's parsing time goes, by switching parts off (median of 5 runs): rea
 A C++ port of the step 1 parser (commit 01c8a40) ran 3.5% faster on the board but its extra code lowered the score to 70.46, so it was reverted (commit 171aa0e).
 
 Memory, later: no transparent huge pages (prctl), and the 2 MB region-to-country table is freed once each region has its country's rank, before the parse. Laptop, 8 runs each: peak 11.0 to 11.6 MB before, 9.1 to 9.6 MB after in 6 of 8 runs (12.8 and 13.1 MB in the other two, the usual run-to-run spread).
+
+Tried after that, not kept: regions.csv read on all threads, a part of its lines each, in two passes (countries used, then each region's rank written into its thread's own range of ids). The regions phase went from 5.0 to 10.6 ms (median about 6.6) to 3.2 to 7.2 ms (median about 4.8), faster in 5 of 6 paired runs; what is left is starting the threads and first touching the table. About 3% of a run against about 34 more code lines, roughly no change in points, so it was dropped.
