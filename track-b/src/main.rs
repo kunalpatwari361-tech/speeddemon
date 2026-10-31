@@ -282,7 +282,7 @@ fn eval<'a>(steps: impl Iterator<Item = (u8, Set<'a>)>, r: &mut [u64], v: &mut V
 }
 
 /// The documents are indexed and queried in this many rounds, so only one round's postings are held.
-const ROUNDS: usize = 8;
+const ROUNDS: usize = 12;
 
 fn main() {
     // No transparent huge pages: one would back a mostly untouched stretch of a lazily filled array,
