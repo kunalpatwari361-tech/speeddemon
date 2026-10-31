@@ -29,24 +29,24 @@ fn map(path: &str) -> &'static [u8] {
 }
 
 /// Open addressing from a non-zero 64-bit key to a dense id, in insertion order, and the id's bitset
-/// index (u32::MAX for none), behind a 64 KB one-bit-per-hash filter that answers most misses
-/// without touching the table.
+/// index (u32::MAX for none), behind a 128 KB filter, two bits of one word per key, that answers most
+/// misses without touching the table.
 struct Table {
     slots: Vec<(u64, u32, u32)>,
     filter: Vec<u64>,
     len: u32,
 }
 
-/// The filter bit of a key: 19 bits of a second hash.
+/// A key's filter word and its two bits there, from a second hash: the top 14 bits pick the word.
 fn bit(key: u64) -> (usize, u64) {
-    let h = (key.wrapping_mul(0xff51_afd7_ed55_8ccd) >> 45) as usize;
-    (h / 64, 1 << (h % 64))
+    let h = key.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    ((h >> 50) as usize, 1 << (h & 63) | 1 << (h >> 6 & 63))
 }
 
 impl Table {
     /// A table with room for fewer than `keys` keys, so a lookup always ends at an empty slot.
     fn new(keys: usize) -> Self {
-        Table { slots: vec![(0, 0, 0); keys.next_power_of_two()], filter: vec![0; 1 << 13], len: 0 }
+        Table { slots: vec![(0, 0, 0); keys.next_power_of_two()], filter: vec![0; 1 << 14], len: 0 }
     }
     fn slot(&self, key: u64) -> usize {
         let mask = self.slots.len() - 1;
@@ -58,7 +58,7 @@ impl Table {
     }
     fn get(&self, key: u64) -> Option<(u32, u32)> {
         let (w, b) = bit(key);
-        if self.filter[w] & b == 0 {
+        if self.filter[w] & b != b {
             return None;
         }
         let (k, id, dense) = self.slots[self.slot(key)];

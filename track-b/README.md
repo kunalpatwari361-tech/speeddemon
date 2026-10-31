@@ -6,7 +6,7 @@ The task, the input files and the exact output format are in the [spec](https://
 
 Rust, standard library only. Both files are memory-mapped; `/data` is already in the page cache, so reading costs no copy and no memory.
 
-Only what the queries ask about is indexed. The queries are parsed first. Every distinct term gets an id, and so does every adjacent pair of terms in a phrase. A token is found and hashed 8 bytes at a time: integer arithmetic on a 64-bit word marks its letters, its digits and the LF that ends the document, and the token's lowercased bytes are mixed into a 64-bit hash a chunk at a time, so a token of up to 7 bytes has a hash no other token has. The hash is looked up in an open-addressing table, sized from the queries, behind a 64 KB filter, one bit per hash, that answers most misses without touching the table.
+Only what the queries ask about is indexed. The queries are parsed first. Every distinct term gets an id, and so does every adjacent pair of terms in a phrase. A token is found and hashed 8 bytes at a time: integer arithmetic on a 64-bit word marks its letters, its digits and the LF that ends the document, and the token's lowercased bytes are mixed into a 64-bit hash a chunk at a time, so a token of up to 7 bytes has a hash no other token has. The hash is looked up in an open-addressing table, sized from the queries, behind a 128 KB filter, two bits of one 64-bit word per key, that answers most misses without touching the table. Most adjacent pairs of query terms are not phrase pairs, so the pair table's filter does most of the work there.
 
 The corpus goes in 12 rounds of one block per hardware thread, each block starting at a document whose id is a multiple of 64:
 
