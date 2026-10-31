@@ -41,8 +41,9 @@ fn bit(key: u64) -> (usize, u64) {
 }
 
 impl Table {
-    fn new(cap: usize) -> Self {
-        Table { slots: vec![(0, 0, 0); (cap * 2).next_power_of_two()], filter: vec![0; 1 << 13], len: 0 }
+    /// A table with room for fewer than `keys` keys, so a lookup always ends at an empty slot.
+    fn new(keys: usize) -> Self {
+        Table { slots: vec![(0, 0, 0); keys.next_power_of_two()], filter: vec![0; 1 << 13], len: 0 }
     }
     fn slot(&self, key: u64) -> usize {
         let mask = self.slots.len() - 1;
@@ -67,17 +68,6 @@ impl Table {
             (self.slots[s], self.len) = ((key, self.len, u32::MAX), self.len + 1);
         }
         self.slots[s].1
-    }
-    /// The same map in the smallest table that holds it, so lookups stay in cache.
-    fn compact(&self) -> Table {
-        let mut t = Table::new(self.len as usize);
-        t.filter.clone_from(&self.filter);
-        for &s in self.slots.iter().filter(|s| s.0 != 0) {
-            let i = t.slot(s.0);
-            t.slots[i] = s;
-        }
-        t.len = self.len;
-        t
     }
 }
 
@@ -258,10 +248,12 @@ fn main() {
 
     // Every query becomes (operator, id) steps: a BOOL's terms as written, a PHRASE's adjacent pairs
     // ANDed (a pair id has the top bit set). A PHRASE also keeps its words, to check longer ones.
-    let words_in_queries = q.iter().filter(|&&c| c == b' ').count();
-    let (mut terms, mut pairs) = (Table::new(words_in_queries), Table::new(words_in_queries));
+    let lines = || q.split(|&c| c == b'\n').filter(|l| !l.is_empty());
+    let spaces = |l: &[u8]| l.iter().filter(|&&c| c == b' ').count() + 1;
+    let phrases = lines().filter(|l| l.starts_with(b"PHRASE")).map(spaces).sum();
+    let (mut terms, mut pairs) = (Table::new(spaces(q)), Table::new(phrases));
     let mut queries = Vec::new();
-    for line in q.split(|&c| c == b'\n').filter(|l| !l.is_empty()) {
+    for line in lines() {
         let phrase = line.starts_with(b"PHRASE");
         let rest = if phrase { &line[8..line.len() - 1] } else { &line[5..] };
         let words: Vec<&[u8]> = rest.split(|&c| c == b' ').collect();
@@ -277,8 +269,7 @@ fn main() {
         queries.push((steps, if phrase { words } else { Vec::new() }));
     }
 
-    let mut index = Index { docs, terms: terms.compact(), pairs: pairs.compact() };
-    drop((terms, pairs));
+    let mut index = Index { docs, terms, pairs };
     let ids = (index.terms.len + index.pairs.len) as usize;
     let n = docs.rsplit(|&c| c == b'\n').nth(1).map_or(0, |last| num(last) + 1); // the last id + 1
     let span: Vec<AtomicU64> = zeroed(n);
