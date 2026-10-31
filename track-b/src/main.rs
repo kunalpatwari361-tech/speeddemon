@@ -128,6 +128,15 @@ fn num(b: &[u8]) -> usize {
     b.iter().take_while(|c| c.is_ascii_digit()).fold(0, |v, &c| v * 10 + (c - b'0') as usize)
 }
 
+/// Runs f(j) for every j in 0..k, each on its own thread, and returns the results in order.
+fn each<T: Send>(k: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    thread::scope(|s| {
+        let f = &f;
+        let hs: Vec<_> = (0..k).map(|j| s.spawn(move || f(j))).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
 struct Index<'a> {
     docs: &'a [u8],
     terms: Table,
@@ -234,6 +243,9 @@ fn eval<'a>(steps: impl Iterator<Item = (u8, Set<'a>)>, r: &mut [u64], v: &mut V
     }
 }
 
+/// The documents are indexed and queried in this many rounds, so only one round's postings are held.
+const ROUNDS: usize = 8;
+
 fn main() {
     let (docs, q) = (map("/data/docs.txt"), map("/data/queries.txt"));
 
@@ -259,126 +271,141 @@ fn main() {
     }
 
     let index = Index { docs, terms: terms.compact(), pairs: pairs.compact() };
+    drop((terms, pairs));
     let ids = (index.terms.len + index.pairs.len) as usize;
     let n = docs.rsplit(|&c| c == b'\n').nth(1).map_or(0, |last| num(last) + 1); // the last id + 1
-    let words = n.div_ceil(64);
     let span: Vec<AtomicU64> = zeroed(n);
     let k = thread::available_parallelism().map_or(1, |x| x.get());
-    let parts = cuts(docs, k);
 
-    // Runs f(part, state) on every part in parallel, each thread with its own state.
-    let each = |f: &(dyn Fn(usize, &mut [(u32, u32)]) -> Vec<u32> + Sync)| -> Vec<Vec<u32>> {
-        thread::scope(|s| {
-            let hs: Vec<_> = (0..parts.len() - 1).map(|j| s.spawn(move || f(j, &mut vec![(0, 0); ids]))).collect();
-            hs.into_iter().map(|h| h.join().unwrap()).collect()
-        })
-    };
+    // The documents go in ROUNDS rounds of k blocks, one block per thread. A round's postings are
+    // built, queried and freed before the next round starts.
+    let blocks = cuts(docs, k * ROUNDS);
+    let first = |b: usize| if blocks[b] < docs.len() { num(&docs[blocks[b]..]) } else { n };
 
-    // A sample, the first thirty-second of every part, estimates which ids are common. Those get a
-    // bitset over all documents, which the full pass sets directly.
-    let sample = each(&|j, state| {
-        index.scan(parts[j], parts[j] + (parts[j + 1] - parts[j]) / 32, state, &span, |_, _, c| *c += 1);
-        state.iter().map(|s| s.1).collect()
+    // A sample, the first thirty-second of every block, estimates which ids are common. Those get a
+    // bitset over the round's documents, which the full pass sets directly.
+    let sample = each(k, |j| {
+        let mut state = vec![(0, 0); ids];
+        for b in (j..k * ROUNDS).step_by(k) {
+            index.scan(blocks[b], blocks[b] + (blocks[b + 1] - blocks[b]) / 32, &mut state, &span, |_, _, c| *c += 1);
+        }
+        state.iter().map(|s| s.1).collect::<Vec<u32>>()
     });
     let mut nbits = 0;
     let bit_of: Vec<Option<usize>> = (0..ids)
         .map(|id| (sample.iter().map(|s| s[id] as usize).sum::<usize>() * 32 * 32 >= n).then(|| (nbits, nbits += 1).0))
         .collect();
-    let bits: Vec<AtomicU64> = zeroed(nbits * words);
-
-    // The full pass: a common id sets its bit; every other hit goes to the thread's stream as
-    // its id, after a marker (top bit set) naming the document.
-    let streams = each(&|j, state| {
-        // Each id's state holds its dense bitset index (or u32::MAX): one lookup per hit.
-        for (s, b) in state.iter_mut().zip(&bit_of) {
-            s.1 = match *b {
-                Some(b) => b as u32,
-                None => u32::MAX,
-            };
-        }
-        let rare: usize = (0..ids).filter(|&id| bit_of[id].is_none()).map(|id| sample[j][id] as usize).sum();
-        let (mut stream, mut last) = (Vec::with_capacity(rare * 33 + n / k), u32::MAX);
-        index.scan(parts[j], parts[j + 1], state, &span, |doc, id, dense| {
-            if *dense != u32::MAX {
-                let w = &bits[*dense as usize * words + doc as usize / 64];
-                w.store(w.load(Relaxed) | 1 << (doc % 64), Relaxed);
-            } else {
-                if doc != last {
-                    (last, _) = (doc, stream.push(1 << 31 | doc));
-                }
-                stream.push(id as u32);
-            }
-        });
-        stream
-    });
+    let rare: Vec<usize> = sample.iter().map(|s| (0..ids).filter(|&id| bit_of[id].is_none()).map(|id| s[id] as usize).sum()).collect();
     drop(sample);
 
-    // The other ids get a run of one flat array: count each thread's hits per id, then each
-    // thread places its stream into its own part of every run.
-    let mut counts = each(&|j, _| {
-        let mut count = vec![0u32; ids];
-        streams[j].iter().filter(|&&v| v >> 31 == 0).for_each(|&v| count[v as usize] += 1);
-        count
-    });
-    let df: Vec<usize> = (0..ids).map(|id| counts.iter().map(|c| c[id] as usize).sum()).collect();
-    let mut nflat = 0;
-    let start: Vec<usize> = df.iter().map(|&d| (nflat, nflat += d).0).collect();
-    for id in 0..ids {
-        let mut at = start[id] as u32;
-        for c in counts.iter_mut() {
-            (c[id], at) = (at, at + c[id]);
-        }
-    }
-    let flat: Vec<AtomicU32> = zeroed(nflat);
-    thread::scope(|s| {
-        for (stream, mut cur) in streams.into_iter().zip(counts) {
-            let flat = &flat;
-            s.spawn(move || {
-                let mut doc = 0;
-                for v in stream {
-                    if v >> 31 == 1 {
-                        doc = v & !(1 << 31);
-                    } else {
-                        flat[cur[v as usize] as usize].store(doc, Relaxed);
-                        cur[v as usize] += 1;
+    // Every query's count, id sum and first ten ids, built up round by round.
+    let mut acc = vec![(0u64, 0u64, [0u32; 10]); queries.len()];
+    let chunk = queries.len().div_ceil(k).max(1);
+    for round in 0..ROUNDS {
+        let (d0, d1) = (first(round * k), first(round * k + k));
+        let words = (d1 - d0).div_ceil(64);
+        let bits: Vec<AtomicU64> = zeroed(nbits * words);
+
+        // The full pass: a common id sets its bit; every other hit is counted and goes to the thread's
+        // stream as its id, after a marker (top bit set) naming the document, counted from the round's first.
+        let (streams, mut counts): (Vec<Vec<u32>>, Vec<Vec<u32>>) = each(k, |j| {
+            // An id's state is (last document + 1, its bitset index), or for a rare id (.., 1 << 31 | hits).
+            let mut state: Vec<(u32, u32)> = bit_of.iter().map(|b| (0, b.map_or(1 << 31, |b| b as u32))).collect();
+            let b = round * k + j;
+            let (mut stream, mut last) = (Vec::with_capacity(rare[j] * 33 / ROUNDS + first(b + 1) - first(b)), u32::MAX);
+            index.scan(blocks[b], blocks[b + 1], &mut state, &span, |doc, id, x| {
+                let doc = doc - d0 as u32;
+                if *x >> 31 == 0 {
+                    let w = &bits[*x as usize * words + doc as usize / 64];
+                    w.store(w.load(Relaxed) | 1 << (doc % 64), Relaxed);
+                } else {
+                    *x += 1;
+                    if doc != last {
+                        (last, _) = (doc, stream.push(1 << 31 | doc));
                     }
+                    stream.push(id as u32);
                 }
             });
-        }
-    });
-    let bits: Vec<u64> = bits.into_iter().map(AtomicU64::into_inner).collect();
-    let flat: Vec<u32> = flat.into_iter().map(AtomicU32::into_inner).collect();
-    let nt = index.terms.len;
-    let set = |id: u32| {
-        let id = if id >> 31 == 1 { (nt + (id & !(1 << 31))) as usize } else { id as usize };
-        match bit_of[id] {
-            Some(b) => Set::Bits(&bits[b * words..][..words]),
-            None => Set::Ids(&flat[start[id]..start[id] + df[id]]),
-        }
-    };
+            (stream, state.iter().map(|s| if s.1 >> 31 == 1 { s.1 & !(1 << 31) } else { 0 }).collect())
+        })
+        .into_iter()
+        .unzip();
 
-    // Answer the queries in k contiguous blocks, each into its own buffer.
-    let outs: Vec<Vec<u8>> = thread::scope(|s| {
-        let hs: Vec<_> = queries
-            .chunks(queries.len().div_ceil(k).max(1))
-            .map(|block| {
+        // The other ids get a run of one flat array, and each thread places its stream into its own
+        // part of every run: its count of an id becomes its cursor in the id's run.
+        let mut start = vec![0u32; ids + 1];
+        for id in 0..ids {
+            let mut at = start[id];
+            for c in counts.iter_mut() {
+                (c[id], at) = (at, at + c[id]);
+            }
+            start[id + 1] = at;
+        }
+        let flat: Vec<AtomicU32> = zeroed(start[ids] as usize);
+        thread::scope(|s| {
+            for (stream, mut cur) in streams.into_iter().zip(counts) {
+                let flat = &flat;
+                s.spawn(move || {
+                    let mut doc = 0;
+                    for v in stream {
+                        if v >> 31 == 1 {
+                            doc = v & !(1 << 31);
+                        } else {
+                            flat[cur[v as usize] as usize].store(doc, Relaxed);
+                            cur[v as usize] += 1;
+                        }
+                    }
+                });
+            }
+        });
+        let bits: Vec<u64> = bits.into_iter().map(AtomicU64::into_inner).collect();
+        let flat: Vec<u32> = flat.into_iter().map(AtomicU32::into_inner).collect();
+        let nt = index.terms.len;
+        let set = |id: u32| {
+            let id = if id >> 31 == 1 { (nt + (id & !(1 << 31))) as usize } else { id as usize };
+            match bit_of[id] {
+                Some(b) => Set::Bits(&bits[b * words..][..words]),
+                None => Set::Ids(&flat[start[id] as usize..start[id + 1] as usize]),
+            }
+        };
+
+        // Answer the queries on the round's documents in k contiguous blocks of queries.
+        thread::scope(|s| {
+            for (block, acc) in queries.chunks(chunk).zip(acc.chunks_mut(chunk)) {
                 let (set, span) = (&set, &span);
                 s.spawn(move || {
-                    let (mut r, mut v, mut out) = (vec![0u64; words], Vec::new(), Vec::new());
-                    for (steps, phrase) in block {
+                    let (mut r, mut v) = (vec![0u64; words], Vec::new());
+                    for ((steps, phrase), (count, sum, ten)) in block.iter().zip(acc) {
                         eval(steps.iter().map(|&(op, id)| (op, set(id))), &mut r, &mut v);
                         if phrase.len() > 2 {
                             // Every adjacent pair occurs; check the words occur together, in order.
                             v.retain(|&d| {
-                                let sp = span[d as usize].load(Relaxed);
+                                let sp = span[d0 + d as usize].load(Relaxed);
                                 let toks: Vec<&[u8]> = tokens(&docs[(sp >> 32) as usize..sp as u32 as usize]).collect();
                                 toks.windows(phrase.len()).any(|w| w.iter().zip(phrase).all(|(a, b)| a.eq_ignore_ascii_case(b)))
                             });
                         }
-                        let sum: u64 = v.iter().map(|&d| d as u64).sum();
-                        write!(out, "{} {sum}", v.len()).unwrap();
-                        v.iter().take(10).for_each(|d| write!(out, " {d}").unwrap());
-                        out.push(b'\n');
+                        let have = (*count).min(10) as usize;
+                        ten[have..].iter_mut().zip(&v).for_each(|(t, &d)| *t = d0 as u32 + d);
+                        *count += v.len() as u64;
+                        *sum += v.iter().map(|&d| (d0 + d as usize) as u64).sum::<u64>();
+                    }
+                });
+            }
+        });
+    }
+
+    // Write the answers in k contiguous blocks, each into its own buffer.
+    let outs: Vec<Vec<u8>> = thread::scope(|s| {
+        let hs: Vec<_> = acc
+            .chunks(chunk)
+            .map(|block| {
+                s.spawn(move || {
+                    let mut out = Vec::new();
+                    for (count, sum, ten) in block {
+                        write!(out, "{count} {sum}").unwrap();
+                        ten[..(*count).min(10) as usize].iter().for_each(|d| write!(out, " {d}").unwrap());
+                        writeln!(out).unwrap();
                     }
                     out
                 })
