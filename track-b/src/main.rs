@@ -9,6 +9,13 @@ extern "C" {
 }
 
 /// The whole file, read-only. /data is already in the page cache, so this costs no memory.
+/// n zeroed values (all-zero bytes are valid for these atomics), whose pages the kernel supplies
+/// only when first touched.
+fn zeroed<T>(n: usize) -> Vec<T> {
+    let layout = std::alloc::Layout::array::<T>(n.max(1)).unwrap();
+    unsafe { Vec::from_raw_parts(std::alloc::alloc_zeroed(layout) as *mut T, n, n.max(1)) }
+}
+
 fn map(path: &str) -> &'static [u8] {
     let f = File::open(path).unwrap();
     let len = f.metadata().unwrap().len() as usize;
@@ -255,7 +262,7 @@ fn main() {
     let ids = (index.terms.len + index.pairs.len) as usize;
     let n = docs.rsplit(|&c| c == b'\n').nth(1).map_or(0, |last| num(last) + 1); // the last id + 1
     let words = n.div_ceil(64);
-    let span: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(0)).collect();
+    let span: Vec<AtomicU64> = zeroed(n);
     let k = thread::available_parallelism().map_or(1, |x| x.get());
     let parts = cuts(docs, k);
 
@@ -277,19 +284,25 @@ fn main() {
     let bit_of: Vec<Option<usize>> = (0..ids)
         .map(|id| (sample.iter().map(|s| s[id] as usize).sum::<usize>() * 32 * 32 >= n).then(|| (nbits, nbits += 1).0))
         .collect();
-    let bits: Vec<AtomicU64> = (0..nbits * words).map(|_| AtomicU64::new(0)).collect();
+    let bits: Vec<AtomicU64> = zeroed(nbits * words);
 
     // The full pass: a common id sets its bit; every other hit goes to the thread's stream as
     // its id, after a marker (top bit set) naming the document.
     let streams = each(&|j, state| {
+        // Each id's state holds its dense bitset index (or u32::MAX): one lookup per hit.
+        for (s, b) in state.iter_mut().zip(&bit_of) {
+            s.1 = match *b {
+                Some(b) => b as u32,
+                None => u32::MAX,
+            };
+        }
         let rare: usize = (0..ids).filter(|&id| bit_of[id].is_none()).map(|id| sample[j][id] as usize).sum();
         let (mut stream, mut last) = (Vec::with_capacity(rare * 33 + n / k), u32::MAX);
-        index.scan(parts[j], parts[j + 1], state, &span, |doc, id, _| match bit_of[id] {
-            Some(b) => {
-                let w = &bits[b * words + doc as usize / 64];
+        index.scan(parts[j], parts[j + 1], state, &span, |doc, id, dense| {
+            if *dense != u32::MAX {
+                let w = &bits[*dense as usize * words + doc as usize / 64];
                 w.store(w.load(Relaxed) | 1 << (doc % 64), Relaxed);
-            }
-            None => {
+            } else {
                 if doc != last {
                     (last, _) = (doc, stream.push(1 << 31 | doc));
                 }
@@ -316,7 +329,7 @@ fn main() {
             (c[id], at) = (at, at + c[id]);
         }
     }
-    let flat: Vec<AtomicU32> = (0..nflat).map(|_| AtomicU32::new(0)).collect();
+    let flat: Vec<AtomicU32> = zeroed(nflat);
     thread::scope(|s| {
         for (stream, mut cur) in streams.into_iter().zip(counts) {
             let flat = &flat;
