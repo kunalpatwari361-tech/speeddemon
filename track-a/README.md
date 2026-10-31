@@ -22,4 +22,4 @@ None.
 
 ## With another 24 hours
 
-Smaller records, since their 6 bytes each are most of the peak memory, and selecting the three percentiles instead of sorting.
+Process each hour as soon as no later line can belong to it, since the file is nearly in time order: the records would no longer all be held at once, and the peak memory would fall to about the size of the output.
