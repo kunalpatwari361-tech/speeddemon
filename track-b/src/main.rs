@@ -236,13 +236,17 @@ fn has(bits: &[u64], d: u32) -> bool {
     bits[d as usize / 64] >> (d % 64) & 1 == 1
 }
 
-/// Evaluates (operator, set) steps left to right into v, as ascending ids: '=' load, 'A' and,
-/// 'O' or, 'N' and-not. The result is held as the bitset r instead only while loading or ORing
-/// in a common term has made it large; an AND with ids makes it a list again.
-fn eval<'a>(steps: impl Iterator<Item = (u8, Set<'a>)>, r: &mut [u64], v: &mut Vec<u32>) {
+/// Evaluates (operator, id) steps left to right into v, as ascending ids: '=' load, 'A' and,
+/// 'O' or, 'N' and-not, with set(id) an id's documents. The result is held as the bitset r instead
+/// only while loading or ORing in a common term has made it large; an AND with ids makes it a list
+/// again. An empty list with no OR still to come is the answer, and the other steps are not read.
+fn eval<'a>(steps: &[(u8, u32)], set: impl Fn(u32) -> Set<'a>, r: &mut [u64], v: &mut Vec<u32>) {
     let mut dense = false;
-    for (op, s) in steps {
-        match (op, s, dense) {
+    for (i, &(op, id)) in steps.iter().enumerate() {
+        if i > 0 && !dense && v.is_empty() && steps[i..].iter().all(|s| s.0 != b'O') {
+            break;
+        }
+        match (op, set(id), dense) {
             (b'=', Set::Ids(a), _) => (v.clear(), v.extend_from_slice(a), dense = false).0,
             (b'=', Set::Bits(b), _) => (r.copy_from_slice(b), dense = true).0,
             (_, Set::Bits(b), false) if op != b'O' => v.retain(|&d| has(b, d) == (op == b'A')),
@@ -439,7 +443,7 @@ fn main() {
                 s.spawn(move || {
                     let (mut r, mut v, mut phrase) = (vec![0u64; words], Vec::new(), Vec::new());
                     for (&[from, to, at, stop], (count, sum, ten)) in block.iter().zip(acc) {
-                        eval(steps[from as usize..to as usize].iter().map(|&(op, id)| (op, set(id))), &mut r, &mut v);
+                        eval(&steps[from as usize..to as usize], set, &mut r, &mut v);
                         if to - from > 1 && stop > at {
                             // Every adjacent pair occurs; check the words occur together, in order.
                             phrase.clear();
