@@ -106,6 +106,20 @@ fn records(parts: &[[Stream; HOURS]], h: usize, mut f: impl FnMut(u16, u32)) {
     }
 }
 
+/// The values at the ascending ranks ks of run, by nested selection: each rank is selected only
+/// among the values above the previous one, so the three cost about 1.55 times one pass.
+fn ranks(run: &mut [u32], ks: [usize; 3]) -> [u32; 3] {
+    let (mut from, mut out) = (0, [0; 3]);
+    for (o, &k) in out.iter_mut().zip(&ks) {
+        if k >= from {
+            run[from..].select_nth_unstable(k - from);
+            from = k + 1;
+        }
+        *o = run[k];
+    }
+    out
+}
+
 /// Appends v in decimal.
 fn push_num(out: &mut Vec<u8>, mut v: usize) {
     let mut digits = [0u8; 20];
@@ -236,18 +250,17 @@ fn main() {
                         if n == 0 {
                             continue;
                         }
-                        lat[at[s] - n..at[s]].sort_unstable();
-                        let run = &lat[at[s] - n..at[s]];
-                        let pct = |p: usize| run[(p * n + 99) / 100 - 1];
+                        let rank = |p: usize| (p * n + 99) / 100 - 1;
+                        let [p50, p95, p99] = ranks(&mut lat[at[s] - n..at[s]], [rank(50), rank(95), rank(99)]);
                         let e = errors[s] as usize;
                         out.extend_from_slice(text.as_bytes());
                         out.push(b' ');
                         out.extend_from_slice(name);
                         for x in [
                             n,
-                            pct(50) as usize,
-                            pct(95) as usize,
-                            pct(99) as usize,
+                            p50 as usize,
+                            p95 as usize,
+                            p99 as usize,
                             e,
                             e * 1_000_000 / n,
                         ] {
