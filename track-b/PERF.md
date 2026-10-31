@@ -6,6 +6,8 @@ Every step from the reference to your final version, each with the live-board ru
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 56.35 | 2,200 | 0 |
 | 1 | One scan indexes only the query terms and adjacent query-term pairs: common ids as bitsets, the rest as posting lists placed from per-thread hit streams | run-20244f1c82c7 | 0.4071 | 199.4 | 58.98 |
+| 2 | Rounds: the documents are indexed and queried an eighth at a time, so only one round's postings are held | run-00de16a83ce2 | 0.4271 | 72.4 (69.0 MiB) | 62.57 |
+| 3 | A rare id reported once per document, no per-id state; query tables sized from the queries; tokens found and hashed 8 bytes at a time (three commits, measured together) | run-73886d267709 | 0.4309 | 62.2 | 63.07 |
 
 ## Local experiments after step 1
 
@@ -22,3 +24,5 @@ Measured on a laptop (Intel Core i5-1335U: 2 performance and 8 efficiency cores,
 | All kept changes against step 1 | 927 → 669 | 12 of 12 | 178 → 45 | |
 
 Code lines (rustfmt, then scc, as the board counts them): 420 at step 1, 468 with the kept changes.
+
+On the board the memory fell as measured here, but the time did not: the laptop put the three changes of step 3 at about 22% faster, and the board measured 0.4271 s before them and 0.4309 s after. The same unchanged Track D code has measured from 0.381 s to 0.448 s on the board, so a few percent either way is within its noise.
