@@ -50,6 +50,15 @@ fn hour_text(hour: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{:02}:00:00Z", hour % 24)
 }
 
+/// The 8 bytes at b[i..] as a word, and how many come before its first space (8 if none): the
+/// first space is the first zero byte after an xor with spaces.
+fn word(b: &[u8], i: usize) -> (u64, usize) {
+    let w = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+    let x = w ^ 0x2020_2020_2020_2020;
+    let space = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
+    (w, if space == 0 { 8 } else { space.trailing_zeros() as usize / 8 })
+}
+
 /// Endpoints, interned into one lock-free open-addressing table shared by all threads. A slot
 /// holds the endpoint's 64-bit hash, which identifies it among the 1,842 (a collision is about
 /// 1 in 10^13), and `at` holds offset << 8 | length of one occurrence in the file.
@@ -88,19 +97,12 @@ impl Endpoints<'_> {
                 stamp = w;
                 h = (day(&b[i..]) * 24 + num(&b[i + 11..i + 13]) - base) as usize;
             }
-            let mut j = i + 28;
-            while b[j] != b' ' {
-                j += 1;
-            }
-            // The endpoint, 8 bytes at a time: a word's first space is its first zero byte after
-            // xor with spaces. At least " 200 0\n" follows it, so every 8-byte read is in bounds.
-            let (at, mut hash) = (j + 1, 0u64);
-            j += 1;
+            // The method (3 to 7 bytes), then the endpoint, 8 bytes at a time. At least " 200 0\n"
+            // follows the endpoint, so every 8-byte read is in bounds.
+            let at = i + 29 + word(b, i + 28).1;
+            let (mut j, mut hash) = (at, 0u64);
             loop {
-                let w = u64::from_le_bytes(b[j..j + 8].try_into().unwrap());
-                let x = w ^ 0x2020_2020_2020_2020;
-                let space = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
-                let n = if space == 0 { 8 } else { space.trailing_zeros() as usize / 8 };
+                let (w, n) = word(b, j);
                 let keep = if n == 8 { u64::MAX } else { (1 << (8 * n)) - 1 };
                 hash = (hash ^ w & keep).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(23);
                 j += n;
@@ -131,19 +133,24 @@ fn main() {
     let mut cut: Vec<usize> = (0..k).map(|j| b.len() * j / k).map(|p| if p == 0 { 0 } else { next(p) }).collect();
     cut.push(b.len());
 
-    // One parse: each thread counts its requests per group and keeps (group, latency) per line;
+    // One parse: each thread counts its requests per group (a group has far fewer than 65,536)
+    // and keeps (group, latency) per line, in chunks that are freed as soon as they are placed;
     // 5xx per group are counted in one shared table, since they are rare.
+    const CHUNK: usize = 1 << 16;
     let errors: Vec<AtomicU32> = zeroed(SLOTS * HOURS);
-    let (counts, records): (Vec<Vec<u32>>, Vec<Vec<u64>>) = thread::scope(|s| {
+    let (counts, records): (Vec<Vec<u16>>, Vec<Vec<Vec<u64>>>) = thread::scope(|s| {
         let hs: Vec<_> = cut
             .windows(2)
             .map(|w| {
                 let (ep, errors) = (&ep, &errors);
                 s.spawn(move || {
-                    let (mut count, mut records) = (vec![0u32; SLOTS * HOURS], Vec::with_capacity((w[1] - w[0]) / 64));
+                    let (mut count, mut records) = (vec![0u16; SLOTS * HOURS], vec![Vec::with_capacity(CHUNK)]);
                     ep.each(w[0], w[1], base, |g, l, error| {
                         count[g] += 1;
-                        records.push((g as u64) << 32 | l as u64);
+                        if records.last().unwrap().len() == CHUNK {
+                            records.push(Vec::with_capacity(CHUNK));
+                        }
+                        records.last_mut().unwrap().push((g as u64) << 32 | l as u64);
                         if error {
                             errors[g].fetch_add(1, Relaxed);
                         }
@@ -166,25 +173,27 @@ fn main() {
     eps.sort_unstable();
 
     // Every group's latencies get one run of a flat array, laid out in output order; each thread
-    // fills its own part of every run.
+    // fills its own part of every run, its count becoming its cursor within the run.
     let (mut start, mut end) = (vec![0u32; SLOTS * HOURS], vec![0u32; SLOTS * HOURS]);
     let (mut cursors, mut at) = (counts, 0);
     for g in (0..HOURS).flat_map(|h| eps.iter().map(move |&(_, s)| s * HOURS + h)) {
-        start[g] = at;
+        let mut size = 0;
         for c in cursors.iter_mut() {
-            (c[g], at) = (at, at + c[g]);
+            (c[g], size) = (size, size + c[g]);
         }
-        end[g] = at;
+        (start[g], end[g], at) = (at, at + size as u32, at + size as u32);
     }
     let lat = zeroed(at as usize);
     thread::scope(|s| {
         for (mut cur, records) in cursors.into_iter().zip(records) {
-            let lat = &lat;
+            let (lat, start) = (&lat, &start);
             s.spawn(move || {
-                for r in records {
-                    let g = (r >> 32) as usize;
-                    lat[cur[g] as usize].store(r as u32, Relaxed);
-                    cur[g] += 1;
+                for chunk in records {
+                    for r in chunk {
+                        let g = (r >> 32) as usize;
+                        lat[(start[g] + cur[g] as u32) as usize].store(r as u32, Relaxed);
+                        cur[g] += 1;
+                    }
                 }
             });
         }
