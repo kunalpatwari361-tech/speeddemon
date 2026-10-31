@@ -8,12 +8,6 @@ extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
 }
 
-// The record parser, in C++ (native/parse.cpp), built into native/libparse.a by the Dockerfile.
-#[link(name = "parse", kind = "static")]
-extern "C" {
-    fn parse_part(b: *const u8, from: usize, to: usize, group: *const u8, groups: usize, unmatched: usize, slots: *mut u64, seen: *mut u64, agg: *mut Agg);
-}
-
 /// The whole file, read-only. /data is already in the page cache, so this costs no memory.
 /// n zeroed atomics (all-zero bytes are valid), whose pages the kernel supplies only when first touched.
 fn zeroed(n: usize) -> Vec<AtomicU64> {
@@ -41,6 +35,40 @@ fn num(b: &[u8], i: &mut usize) -> u64 {
     v
 }
 
+/// The first `"` at or after i, 8 bytes at a time: it is the first zero byte of a word xored
+/// with quotes. A record's end follows every quote, so every 8-byte read is in bounds.
+fn quote(b: &[u8], mut i: usize) -> usize {
+    loop {
+        let x = u64::from_le_bytes(b[i..i + 8].try_into().unwrap()) ^ 0x2222_2222_2222_2222;
+        let found = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
+        if found != 0 {
+            return i + found.trailing_zeros() as usize / 8;
+        }
+        i += 8;
+    }
+}
+
+/// A text field at b[*i] as (start, raw length, value length); leaves *i past its comma.
+/// The raw bytes of a quoted field identify its value, since escaping is one to one.
+fn field(b: &[u8], i: &mut usize) -> (usize, usize, u64) {
+    let start = *i;
+    if b[start] != b'"' {
+        *i += b[start..].iter().position(|&c| c == b',').unwrap() + 1;
+        return (start, *i - 1 - start, (*i - 1 - start) as u64);
+    }
+    let (mut j, mut escapes) = (start + 1, 0);
+    loop {
+        j = quote(b, j);
+        if b[j + 1] != b'"' {
+            break;
+        }
+        escapes += 1;
+        j += 2;
+    }
+    *i = j + 2;
+    (start + 1, j - start - 1, (j - start - 1 - escapes) as u64)
+}
+
 /// A record starts right after an LF with a digit or a BOM. Inside a quoted note an LF is
 /// always followed by a lowercase word or a quote, so this finds a true boundary.
 fn record_start(b: &[u8], mut p: usize) -> usize {
@@ -56,8 +84,6 @@ fn money(c: i64) -> String {
 
 const SLOT_BITS: u32 = 17; // the name pool is 100,000 values: 2^17 slots, 76% full
 
-/// One group's totals. The C++ parser fills them in, so the layout is C's.
-#[repr(C)]
 #[derive(Clone, Copy)]
 struct Agg {
     count: u64,
@@ -89,13 +115,28 @@ fn main() {
     let group: Vec<u8> = region.iter().map(|&c| rank[(c as usize).min(used.len())]).collect();
 
     // Every distinct name gets a slot in one shared open-addressing table, and each group
-    // marks the slots of its names in its own bitset. A slot holds a name's 64-bit hash, which
-    // identifies it among the 100,000 (a collision is about 1 in 4 billion).
+    // marks the slots of its names in its own bitset.
     let b = map("/data/records.csv");
     let slots: Vec<AtomicU64> = zeroed(1 << SLOT_BITS);
     let seen: Vec<AtomicU64> = zeroed((unmatched + 1) << (SLOT_BITS - 6));
+    // A slot holds a name's 64-bit hash, which identifies it among the 100,000 (a collision is
+    // about 1 in 4 billion).
+    let slot_of = |at: usize, len: usize| {
+        let hash = b[at..at + len].iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &c| (h ^ c as u64).wrapping_mul(0x100_0000_01b3)) | 1;
+        let mut s = (hash.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - SLOT_BITS)) as usize;
+        loop {
+            match slots[s].load(Relaxed) {
+                v if v == hash => return s,
+                0 => match slots[s].compare_exchange(0, hash, Relaxed, Relaxed) {
+                    Ok(_) => return s,
+                    Err(v) if v == hash => return s,
+                    Err(_) => {}
+                },
+                _ => s = (s + 1) & ((1 << SLOT_BITS) - 1),
+            }
+        }
+    };
 
-    // Each part of the file is parsed in C++, into that part's own totals per group.
     let k = thread::available_parallelism().map_or(1, |x| x.get());
     let body = b.iter().position(|&c| c == b'\n').map_or(b.len(), |p| p + 1);
     let mut cut: Vec<usize> = (0..k).map(|j| record_start(b, body + (b.len() - body) * j / k).max(body)).collect();
@@ -106,22 +147,37 @@ fn main() {
         let hs: Vec<_> = cut
             .windows(2)
             .map(|w| {
-                let (group, slots, seen) = (&group, &slots, &seen);
+                let (group, seen, slot_of) = (&group, &seen, &slot_of);
                 s.spawn(move || {
                     let mut agg = vec![empty; unmatched + 1];
-                    unsafe {
-                        parse_part(
-                            b.as_ptr(),
-                            w[0],
-                            w[1],
-                            group.as_ptr(),
-                            group.len(),
-                            unmatched,
-                            slots.as_ptr() as *mut u64,
-                            seen.as_ptr() as *mut u64,
-                            agg.as_mut_ptr(),
-                        )
-                    };
+                    let mut i = w[0];
+                    while i < w[1] {
+                        if b[i] == 0xEF {
+                            i += 3;
+                        }
+                        let id = num(b, &mut i);
+                        let (name_at, name_raw, name_len) = field(b, &mut i);
+                        let (_, _, note_len) = field(b, &mut i);
+                        let g = *group.get(num(b, &mut i) as usize).unwrap_or(&(unmatched as u8)) as usize;
+                        let neg = b[i] == b'-';
+                        i += neg as usize;
+                        let cents = (num(b, &mut i) * 100 + (b[i] - b'0') as u64 * 10 + (b[i + 1] - b'0') as u64) as i64;
+                        let cents = if neg { -cents } else { cents };
+                        i += 2 + (b[i + 2] == b'\r') as usize + 1;
+
+                        let a = &mut agg[g];
+                        a.count += 1;
+                        a.ids += id;
+                        a.sum += cents;
+                        a.min = a.min.min(cents);
+                        a.max = a.max.max(cents);
+                        a.name_bytes += name_len;
+                        a.note_bytes += note_len;
+                        let bit = g << SLOT_BITS | slot_of(name_at, name_raw);
+                        if seen[bit / 64].load(Relaxed) >> (bit % 64) & 1 == 0 {
+                            seen[bit / 64].fetch_or(1 << (bit % 64), Relaxed);
+                        }
+                    }
                     agg
                 })
             })
