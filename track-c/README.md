@@ -12,7 +12,7 @@ Rust, standard library only. Both files are memory-mapped; `/data` is already in
 
 Distinct names are counted without storing any strings. Every name gets a slot in one lock-free open-addressing table of 2^17 slots (76% full at 100,000 names), shared by all threads and allocated lazily, keyed by a 64-bit hash of the name's raw bytes, taken 8 at a time. The raw bytes identify the value because escaping is one to one, and among 100,000 names a 64-bit collision is about 1 in 4 billion. Each country has a bitset over those slots, and its distinct count is the bitset's population count.
 
-The binary is built for the scoring CPU (`target-cpu=native`).
+The release binary is built for the scoring CPU (`target-cpu=native`) with profile-guided optimisation. During the offline build, the included unmodified public generator creates a full training dataset; the instrumented binary runs on that generated data, then `llvm-profdata` guides the final build. The runtime image contains only the Rust executable.
 
 ## Dependencies
 

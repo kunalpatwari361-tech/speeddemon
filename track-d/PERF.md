@@ -24,3 +24,13 @@ The laptop's timings move widely within a session (one build's full runs ranged 
 Memory, later: no transparent huge pages (prctl), and the old-to-new numbering (7 MB) is freed before the searches, once the queries are renamed. Laptop, 6 runs each: peak 130 to 139 MiB before (median about 137), 133 to 138 MiB after (median about 134); the searches' per-thread distance tables, about 68 MiB, set the peak.
 
 Where the memory goes (laptop, full scale, the cgroup's peak read after each phase, 2 runs): the parse holds every edge as a triple, 66 MiB; building the adjacency array next to them peaks at 111 MiB; the renumbering stays below that; the searches then lift the peak to 130 to 132 MiB with each thread's distance table. Below 111 MiB the build itself would have to change, since it holds the triples and the adjacency array, or the two adjacency arrays while renumbering, at the same time.
+
+## Local full-data experiments (not board runs)
+
+The bidirectional-search candidate produced the official seed-1 full output hash but was slower in all 8 interleaved pairs against the unidirectional radix search. In this Windows Docker run, median process time rose from 2.009 s to 2.834 s. The reverse graph and second distance table were dropped.
+
+Grouping exact duplicate queries (full hash correct) was also dropped: the candidate was faster in 3 of 8 pairs, with median time 1.940 s versus 1.816 s for the baseline. The grouped candidate also skipped sources with no outgoing edges, but the combination did not beat the baseline.
+
+A chunked decimal parser with 64-bit delimiter detection matched the full hash. In two separate 8-pair batches, baseline-to-parser medians were 2.552 s to 2.317 s, then 1.543 s to 1.553 s; it was faster in 5 of 8 pairs in each batch but did not show a repeatable median gain. It adds about 32 Rust code lines, so it was dropped.
+
+PGO trained on full data from seed 2 and seed 1 both matched the full hash. Seed 2 was slower in the 8-pair comparison (median 3.065 s versus 2.888 s); seed 1 was effectively tied (1.637 s versus 1.641 s, 4 of 8 pairs faster). Neither profile was retained. All these Windows Docker timings varied widely and are local experiments, not board results.
