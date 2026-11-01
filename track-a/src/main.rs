@@ -270,7 +270,8 @@ fn main() {
                     });
                     free_hour(parts, h);
                     let text = hour_text(base + h as u64);
-                    let mut out = Vec::new();
+                    // An hour's lines are about 140 KB; sizing the buffer once spares its regrowth.
+                    let mut out = Vec::with_capacity(1 << 18);
                     for &(name, s) in eps {
                         let n = count[s] as usize;
                         if n == 0 {
