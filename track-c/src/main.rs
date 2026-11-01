@@ -221,9 +221,9 @@ fn main() {
                                     a.name_bytes += name.2;
                                     a.note_bytes += note_len;
                                     let bit = g << SLOT_BITS | slot_of(name.0, name.1);
-                                    // OR is idempotent; most (country, name) pairs are new in this
-                                    // uniform name pool, so avoid a separate atomic load and branch.
-                                    seen[bit / 64].fetch_or(1 << (bit % 64), Relaxed);
+                                    if seen[bit / 64].load(Relaxed) >> (bit % 64) & 1 == 0 {
+                                        seen[bit / 64].fetch_or(1 << (bit % 64), Relaxed);
+                                    }
                                 }
                             }
                             (start, field_quotes, field) = (p + 1, before, (field + 1) % 5);

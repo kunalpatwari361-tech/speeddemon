@@ -14,7 +14,7 @@ Distinct names are counted without storing any strings. Every name gets a slot i
 
 The process asks for no transparent huge pages, and the region table is freed before the records are parsed.
 
-The release binary is built for the scoring CPU (`target-cpu=native`) with profile-guided optimisation. During the offline build, the included unmodified public generator creates a full training dataset; the instrumented binary runs on that generated data, then `llvm-profdata` guides the final build. The runtime image contains only the Rust executable.
+The binary is built for the scoring CPU (`target-cpu=native`).
 
 ## Dependencies
 
