@@ -2,7 +2,6 @@ use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Barrier, Mutex};
 use std::thread;
 
 extern "C" {
@@ -112,7 +111,6 @@ fn money(c: i64) -> String {
 }
 
 const SLOT_BITS: u32 = 17; // the name pool is 100,000 values: 2^17 slots, 76% full
-const ROUNDS: usize = 64; // each thread's records are parsed in this many pieces
 
 #[derive(Clone, Copy)]
 struct Agg {
@@ -173,88 +171,68 @@ fn main() {
 
     let k = thread::available_parallelism().map_or(1, |x| x.get());
     let body = b.iter().position(|&c| c == b'\n').map_or(b.len(), |p| p + 1);
-    let pieces = k * ROUNDS;
-    let mut cut: Vec<usize> = (0..pieces).map(|j| record_start(b, body + (b.len() - body) * j / pieces).max(body)).collect();
+    let mut cut: Vec<usize> = (0..k).map(|j| record_start(b, body + (b.len() - body) * j / k).max(body)).collect();
     cut[0] = body;
     cut.push(b.len());
     let empty = Agg { count: 0, ids: 0, sum: 0, min: i64::MAX, max: i64::MIN, name_bytes: 0, note_bytes: 0 };
-    // A record's name bit belongs to its group's owner, thread g % k. Each round, every thread
-    // parses its next piece, passing each bit to its owner through boxes[from * k + owner]; then
-    // every owner sets its bits with plain stores, as no other thread writes those words.
-    let boxes: Vec<Mutex<Vec<u32>>> = (0..k * k).map(|_| Mutex::new(Vec::new())).collect();
-    let barrier = Barrier::new(k);
     let parts: Vec<Vec<Agg>> = thread::scope(|s| {
-        let (boxes, barrier, cut) = (&boxes, &barrier, &cut);
-        let hs: Vec<_> = (0..k)
-            .map(|me| {
+        let hs: Vec<_> = cut
+            .windows(2)
+            .map(|w| {
                 let (group, seen, slot_of) = (&group, &seen, &slot_of);
                 s.spawn(move || {
                     let mut agg = vec![empty; unmatched + 1];
-                    let mut out = vec![Vec::new(); k];
-                    for w in cut[me * ROUNDS..=(me + 1) * ROUNDS].windows(2) {
-                        // A record's fields end at commas and its LF, the ones outside quotes. In each
-                        // 64-byte block the quote bits, prefix-xored, mark the bytes inside quotes, and
-                        // the quotes counted up to a field's end give its quote count.
-                        let (mut at, mut inside, mut quotes) = (w[0], 0u64, 0u32);
-                        let (mut start, mut field_quotes, mut field) = (w[0] + 3 * (b[w[0]] == 0xEF) as usize, 0, 0);
-                        let (mut id, mut name, mut note_len, mut g) = (0, (0, 0, 0), 0, 0);
-                        while at < w[1] {
-                            let (q, sep) = masks(b, at);
-                            let inq = prefix_xor(q) ^ inside;
-                            inside = 0u64.wrapping_sub(inq >> 63);
-                            let mut ends = sep & !inq;
-                            while ends != 0 {
-                                let p = at + ends.trailing_zeros() as usize;
-                                if p >= w[1] {
-                                    break;
-                                }
-                                let before = quotes + (q & ((1 << (p - at)) - 1)).count_ones();
-                                ends &= ends - 1;
-                                let len = p - start;
-                                match field {
-                                    0 => id = digits(b, start, len),
-                                    1 => name = text(b, start, len, before - field_quotes),
-                                    2 => note_len = text(b, start, len, before - field_quotes).2,
-                                    3 => g = *group.get(digits(b, start, len) as usize).unwrap_or(&(unmatched as u8)) as usize,
-                                    _ => {
-                                        // The amount, [-]digits.dd, then the CR of a CRLF.
-                                        let neg = b[start] == b'-';
-                                        let (s, e) = (start + neg as usize, p - (b[p - 1] == b'\r') as usize);
-                                        let cents = (digits(b, s, e - 3 - s) * 100 + digits(b, e - 2, 2)) as i64;
-                                        let cents = if neg { -cents } else { cents };
-                                        let a = &mut agg[g];
-                                        a.count += 1;
-                                        a.ids += id;
-                                        a.sum += cents;
-                                        a.min = a.min.min(cents);
-                                        a.max = a.max.max(cents);
-                                        a.name_bytes += name.2;
-                                        a.note_bytes += note_len;
-                                        out[g % k].push((g << SLOT_BITS | slot_of(name.0, name.1)) as u32);
+                    // A record's fields end at commas and its LF, the ones outside quotes. In each
+                    // 64-byte block the quote bits, prefix-xored, mark the bytes inside quotes, and
+                    // the quotes counted up to a field's end give its quote count.
+                    let (mut at, mut inside, mut quotes) = (w[0], 0u64, 0u32);
+                    let (mut start, mut field_quotes, mut field) = (w[0] + 3 * (b[w[0]] == 0xEF) as usize, 0, 0);
+                    let (mut id, mut name, mut note_len, mut g) = (0, (0, 0, 0), 0, 0);
+                    while at < w[1] {
+                        let (q, sep) = masks(b, at);
+                        let inq = prefix_xor(q) ^ inside;
+                        inside = 0u64.wrapping_sub(inq >> 63);
+                        let mut ends = sep & !inq;
+                        while ends != 0 {
+                            let p = at + ends.trailing_zeros() as usize;
+                            if p >= w[1] {
+                                break;
+                            }
+                            let before = quotes + (q & ((1 << (p - at)) - 1)).count_ones();
+                            ends &= ends - 1;
+                            let len = p - start;
+                            match field {
+                                0 => id = digits(b, start, len),
+                                1 => name = text(b, start, len, before - field_quotes),
+                                2 => note_len = text(b, start, len, before - field_quotes).2,
+                                3 => g = *group.get(digits(b, start, len) as usize).unwrap_or(&(unmatched as u8)) as usize,
+                                _ => {
+                                    // The amount, [-]digits.dd, then the CR of a CRLF.
+                                    let neg = b[start] == b'-';
+                                    let (s, e) = (start + neg as usize, p - (b[p - 1] == b'\r') as usize);
+                                    let cents = (digits(b, s, e - 3 - s) * 100 + digits(b, e - 2, 2)) as i64;
+                                    let cents = if neg { -cents } else { cents };
+                                    let a = &mut agg[g];
+                                    a.count += 1;
+                                    a.ids += id;
+                                    a.sum += cents;
+                                    a.min = a.min.min(cents);
+                                    a.max = a.max.max(cents);
+                                    a.name_bytes += name.2;
+                                    a.note_bytes += note_len;
+                                    let bit = g << SLOT_BITS | slot_of(name.0, name.1);
+                                    if seen[bit / 64].load(Relaxed) >> (bit % 64) & 1 == 0 {
+                                        seen[bit / 64].fetch_or(1 << (bit % 64), Relaxed);
                                     }
                                 }
-                                (start, field_quotes, field) = (p + 1, before, (field + 1) % 5);
-                                if field == 0 && b.get(start) == Some(&0xEF) {
-                                    start += 3;
-                                }
                             }
-                            quotes += q.count_ones();
-                            at += 64;
-                        }
-                        // Hand this piece's bits over; a box comes back holding the bits its owner
-                        // has already set, so it is cleared and reused.
-                        for (o, v) in out.iter_mut().enumerate() {
-                            std::mem::swap(&mut *boxes[me * k + o].lock().unwrap(), v);
-                            v.clear();
-                        }
-                        barrier.wait();
-                        for from in 0..k {
-                            for &bit in boxes[from * k + me].lock().unwrap().iter() {
-                                let word = &seen[bit as usize / 64];
-                                word.store(word.load(Relaxed) | 1 << (bit % 64), Relaxed);
+                            (start, field_quotes, field) = (p + 1, before, (field + 1) % 5);
+                            if field == 0 && b.get(start) == Some(&0xEF) {
+                                start += 3;
                             }
                         }
-                        barrier.wait();
+                        quotes += q.count_ones();
+                        at += 64;
                     }
                     agg
                 })

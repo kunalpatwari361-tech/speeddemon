@@ -40,21 +40,29 @@ uint64_t day(const uint8_t* t) {
     return y / 400 * 146097 + y % 400 * 365 + y % 400 / 4 - y % 400 / 100 + doy - 719468;
 }
 
-// The slot of an endpoint in the shared table, interned on first sight. spans holds offset << 8 | length
-// of the endpoint's first occurrence in the file.
-size_t intern(std::atomic<uint64_t>* keys, std::atomic<uint64_t>* spans, size_t pos, size_t len, uint64_t hash) {
+// The slot of an endpoint in the shared table. spans holds offset << 8 | length for its first occurrence,
+// so equal hashes are confirmed by comparing the endpoint bytes before reusing a slot.
+size_t intern(const uint8_t* b, std::atomic<uint64_t>* keys, std::atomic<uint64_t>* spans, size_t pos, size_t len, uint64_t hash) {
     uint64_t key = hash | 1;
     size_t s = static_cast<size_t>((hash * K) >> 52);
     for (;;) {
         uint64_t v = keys[s].load(std::memory_order_relaxed);
-        if (v == key) return s;
+        if (v == key) {
+            uint64_t span;
+            do {
+                span = spans[s].load(std::memory_order_acquire);
+            } while (span == 0);
+            size_t old_pos = static_cast<size_t>(span >> 8);
+            size_t old_len = static_cast<size_t>(span & 0xff);
+            if (old_len == len && std::memcmp(b + old_pos, b + pos, len) == 0) return s;
+        }
         if (v == 0) {
             uint64_t expected = 0;
             if (keys[s].compare_exchange_strong(expected, key, std::memory_order_relaxed)) {
-                spans[s].store((static_cast<uint64_t>(pos) << 8) | len, std::memory_order_relaxed);
+                spans[s].store((static_cast<uint64_t>(pos) << 8) | len, std::memory_order_release);
                 return s;
             }
-            if (expected == key) return s;
+            if (expected == key) continue;
             continue;
         }
         s = (s + 1) % SLOTS;
@@ -87,7 +95,7 @@ void scan(const uint8_t* b, size_t from, size_t to, uint64_t base, std::atomic<u
             j += n;
             if (n < 8) break;
         }
-        size_t s = intern(keys, spans, at, j - at, hash);
+        size_t s = intern(b, keys, spans, at, j - at, hash);
         bool error = b[j + 1] == '5';
         j += 5;
         uint32_t lat = 0;
