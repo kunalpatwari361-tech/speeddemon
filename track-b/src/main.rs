@@ -56,6 +56,15 @@ impl Table {
         }
         s
     }
+    /// Starts loading the filter word and the home slot a lookup of key will read.
+    fn prefetch(&self, key: u64) {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        let s = (key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 32) as usize & (self.slots.len() - 1);
+        unsafe {
+            _mm_prefetch(self.filter.as_ptr().add(bit(key).0) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(self.slots.as_ptr().add(s) as *const i8, _MM_HINT_T0);
+        }
+    }
     fn get(&self, key: u64) -> Option<(u32, u32)> {
         let (w, b) = bit(key);
         if self.filter[w] & b != b {
@@ -85,6 +94,7 @@ impl Table {
     }
 }
 
+const AHEAD: usize = 16; // tokens between a lookup's prefetch and the lookup
 const ONES: u64 = 0x0101_0101_0101_0101;
 const HIGH: u64 = 0x8080_8080_8080_8080;
 
@@ -240,6 +250,17 @@ impl Index<'_> {
                 }
                 prev = cur.map(|(c, _)| c);
             };
+            // A token's lookup waits AHEAD tokens after its prefetch; the document's last ones are
+            // looked up at its LF.
+            let (mut ring, mut n, mut done) = ([0u64; AHEAD], 0usize, 0usize);
+            let mut queue = |h: u64| {
+                self.terms.prefetch(h | 1);
+                if n - done == AHEAD {
+                    word(ring[done % AHEAD]);
+                    done += 1;
+                }
+                (ring[n % AHEAD], n) = (h, n + 1);
+            };
             // The text 64 bytes at a time, from a byte that is not inside a token: a token starts at
             // a letter or digit after a byte that is neither, and ends at the next byte that is
             // neither. A token running past the block is read on its own, and the next block
@@ -256,10 +277,10 @@ impl Index<'_> {
                     if e >= 64 {
                         let h;
                         (next, h) = token(b, j + s as usize);
-                        word(h);
+                        queue(h);
                         break;
                     }
-                    word(hash(b, j + s as usize, (e - s) as usize));
+                    queue(hash(b, j + s as usize, (e - s) as usize));
                     starts &= starts - 1;
                 }
                 if stop < 64 && next == j + 64 {
@@ -267,6 +288,9 @@ impl Index<'_> {
                     break;
                 }
                 j = next;
+            }
+            for d in done..n {
+                word(ring[d % AHEAD]);
             }
             end[doc as usize].store(j as u32, Relaxed);
             i = j + 1;
