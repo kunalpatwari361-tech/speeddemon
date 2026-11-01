@@ -24,3 +24,10 @@ A C++ port of the step 1 parser (commit 01c8a40) ran 3.5% faster on the board bu
 Memory, later: no transparent huge pages (prctl), and the 2 MB region-to-country table is freed once each region has its country's rank, before the parse. Laptop, 8 runs each: peak 11.0 to 11.6 MB before, 9.1 to 9.6 MB after in 6 of 8 runs (12.8 and 13.1 MB in the other two, the usual run-to-run spread).
 
 Tried after that, not kept: regions.csv read on all threads, a part of its lines each, in two passes (countries used, then each region's rank written into its thread's own range of ids). The regions phase went from 5.0 to 10.6 ms (median about 6.6) to 3.2 to 7.2 ms (median about 4.8), faster in 5 of 6 paired runs; what is left is starting the threads and first touching the table. About 3% of a run against about 34 more code lines, roughly no change in points, so it was dropped.
+
+Where the parse's time goes now (laptop, full scale, 10 interleaved runs each, switching parts off): 106 ms median as it is, 88 ms without marking distinct names, 48 ms without hashing, probing and marking names. So the names cost about 55% of a run, and marking them about a sixth.
+
+| Change | Median ms, old → new | New faster | Kept |
+|---|---|---|---|
+| Name table of 32-bit tags (512 KB) instead of 64-bit hashes (1 MB), so it stays in cache beside the bitsets | 135 → 144 | 7 of 20 | no, no gain, and two names would merge about once in 7,000 runs |
+| Non-temporal prefetch of the records 512 bytes ahead, so the stream does not push the name table and the bitsets out of the caches | 150 → 173 | 9 of 20 | no, no gain |
