@@ -12,6 +12,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 5 | Twelve rounds instead of eight | run-58d4e30251c5 | 0.3898 | 31.3 | 65.30 |
 | 6 | A query stops once its result is empty with no OR to come (measured at twelve rounds) | run-a4766cffac8b | 0.4526 | 29.3 | 63.70 |
 | 7 | Eight rounds again, with step 6 and a 128 KB two-bit filter in front of the tables (28fa01c, whose own run is no longer in the board data) | run-20d1c6cd1af2 | 0.3730 | 36.5 | 65.80 |
+| 8 | Profile-guided build, source unchanged (e3048e6, measured on e95c13d) | run-4dfd8b2f22f7 | 0.4390 | 37.8 | 63.97 |
+| 8, rerun | The same Track B build, run again on a later commit (931a5f7) | run-a147f3d7e4c3 | 0.3859 | 35.3 | 65.37 |
 
 M is the board's peak memory in MB (10^6 bytes); steps 2, 4, 5 and 6 were read from the board in MiB and converted. The same Track B code has measured from 0.373 to 0.453 s on the board, so a single run cannot show a time change of a few percent; the memory figures are steady.
 
@@ -48,3 +50,4 @@ Rounds again: 12, 8 and 6, 6 runs each, laptop (a slow session, so totals near 1
 Prefetching, dropped: while a query is answered, the run starts and bitset indexes of the query two ahead were prefetched, and from those the first line of each list or bitset of the next one. 8 rounds, 8 paired runs: answer phase median 243 to 227 ms, faster in 4/8, but as a share of each run's full pass 0.345 against 0.342, so no measurable gain; the lists a query reads per round are small and mostly already cached.
 
 Profile-guided build, trained on seed-2 full data from a byte-identical copy of the published `generators/b_index.py` (exempt from the code lines). Laptop, 10 paired full-data runs against the 9013f4d build: median 601 to 539 ms, faster in 7/10, same peak memory and output. Source unchanged.
+On the board (step 8) its two runs measured 0.439 and 0.386 s, inside the 0.373 to 0.453 s the unprofiled build has shown, so the board has not resolved a change in time. S rose from 519 to 529 lines. Kept for now.
