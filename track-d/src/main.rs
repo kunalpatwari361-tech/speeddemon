@@ -175,23 +175,33 @@ fn main() {
     let (n, m) = (num(g, &mut i) as usize, num(g, &mut i) as usize);
     let k = thread::available_parallelism().map_or(1, |x| x.get());
     let parts = cuts(g, i, k);
-    // The graph is read three times, which costs no memory as /data is in the page cache, so only one
-    // edge array is ever held. The first read counts out-degrees and marks nodes with in-edges.
+    // The queries first: only their targets' in-edges are looked for.
+    let q = map("/data/queries.txt");
+    let (mut i, mut raw) = (0, Vec::new());
+    while i < q.len() {
+        raw.push((num(q, &mut i) as usize, num(q, &mut i) as usize));
+    }
+    let mut target = vec![0u64; n / 64 + 1];
+    raw.iter().for_each(|&(_, t)| target[t / 64] |= 1 << (t % 64));
+    // The graph is read twice, which costs no memory as /data is in the page cache. The first read
+    // counts out-degrees and marks the targets that have in-edges.
     let (deg, has_in): (Vec<AtomicU32>, Vec<AtomicU64>) = (zeroed(n + 1), zeroed(n / 64 + 1));
     edges(g, &parts, |u, v, _| {
         deg[u + 1].fetch_add(1, Relaxed);
-        has_in[v / 64].fetch_or(1 << (v % 64), Relaxed);
+        if target[v / 64] >> (v % 64) & 1 == 1 {
+            has_in[v / 64].fetch_or(1 << (v % 64), Relaxed);
+        }
     });
     let mut off: Vec<u32> = deg.into_iter().map(AtomicU32::into_inner).collect();
     for j in 1..=n {
         off[j] += off[j - 1];
     }
-    // The second places each edge's head, with an atomic cursor per node: enough to renumber.
+    // The second places each edge as its head and weight in one 64-bit word, with an atomic cursor per node.
     let next: Vec<AtomicU32> = off[..n].iter().map(|&o| AtomicU32::new(o)).collect();
-    let heads: Vec<AtomicU32> = zeroed(m);
-    edges(g, &parts, |u, v, _| heads[next[u].fetch_add(1, Relaxed) as usize].store(v as u32, Relaxed));
+    let old: Vec<AtomicU64> = zeroed(m);
+    edges(g, &parts, |u, v, w| old[next[u].fetch_add(1, Relaxed) as usize].store((v as u64) << 32 | w, Relaxed));
     drop(next);
-    let heads: Vec<u32> = heads.into_iter().map(AtomicU32::into_inner).collect();
+    let old: Vec<u64> = old.into_iter().map(AtomicU64::into_inner).collect();
 
     // Ids are a random relabelling. Renumber so a search touches nearby memory: k breadth-first
     // searches grow regions in parallel, each claiming unclaimed nodes, and each region gets a
@@ -200,7 +210,7 @@ fn main() {
     let mut regions: Vec<Vec<u32>> = thread::scope(|s| {
         let hs: Vec<_> = (0..k)
             .map(|r| {
-                let (off, heads, owner) = (&off, &heads, &owner);
+                let (off, old, owner) = (&off, &old, &owner);
                 s.spawn(move || {
                     let claim = |v: usize| owner[v].load(Relaxed) == 0 && owner[v].compare_exchange(0, r as u32 + 1, Relaxed, Relaxed).is_ok();
                     let root = r * n / k;
@@ -208,9 +218,9 @@ fn main() {
                     let mut head = 0;
                     while let Some(&u) = order.get(head) {
                         head += 1;
-                        for &v in &heads[off[u as usize] as usize..off[u as usize + 1] as usize] {
-                            if claim(v as usize) {
-                                order.push(v);
+                        for &e in &old[off[u as usize] as usize..off[u as usize + 1] as usize] {
+                            if claim((e >> 32) as usize) {
+                                order.push((e >> 32) as u32);
                             }
                         }
                     }
@@ -221,7 +231,7 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     regions.push((0..n as u32).filter(|&v| owner[v as usize].load(Relaxed) == 0).collect());
-    drop((owner, heads));
+    drop(owner);
 
     // Each region, in parallel, numbers its nodes from its base and records their out-degrees in
     // the new order.
@@ -238,33 +248,40 @@ fn main() {
             });
         }
     });
-    drop((off, regions));
     let new: Vec<u32> = new.into_iter().map(AtomicU32::into_inner).collect();
-    let mut off: Vec<u32> = deg.into_iter().map(AtomicU32::into_inner).collect();
+    let mut off2: Vec<u32> = deg.into_iter().map(AtomicU32::into_inner).collect();
     for j in 1..=n {
-        off[j] += off[j - 1];
+        off2[j] += off2[j - 1];
     }
-    // The third read places every edge, renamed, as its head and weight in one 64-bit word.
-    let next: Vec<AtomicU32> = off[..n].iter().map(|&o| AtomicU32::new(o)).collect();
-    let adj: Vec<AtomicU64> = zeroed(m);
-    edges(g, &parts, |u, v, w| adj[next[new[u] as usize].fetch_add(1, Relaxed) as usize].store((new[v] as u64) << 32 | w, Relaxed));
-    drop(next);
-    let adj: Vec<u64> = adj.into_iter().map(AtomicU64::into_inner).collect();
+    // Then every region copies its nodes' edges, renamed, into its own stretch of the new array.
+    let mut adj = vec![0u64; m];
+    thread::scope(|s| {
+        let mut rest = &mut adj[..];
+        for (r, &b) in regions.iter().zip(&base) {
+            let (mine, tail) = std::mem::take(&mut rest).split_at_mut((off2[b + r.len()] - off2[b]) as usize);
+            rest = tail;
+            let (off, old, new) = (&off, &old, &new);
+            s.spawn(move || {
+                let mut out = mine.iter_mut();
+                for &u in r {
+                    for &e in &old[off[u as usize] as usize..off[u as usize + 1] as usize] {
+                        *out.next().unwrap() = (new[(e >> 32) as usize] as u64) << 32 | e & 0xffff_ffff;
+                    }
+                }
+            });
+        }
+    });
+    drop((off, old, regions));
+    let off = off2;
+    // A target with no in-edges is answered -1 without searching, which avoids settling the whole
+    // graph; it is marked by a renamed target of u32::MAX.
+    let reach = |s: usize, t: usize| s == t || has_in[t / 64].load(Relaxed) >> (t % 64) & 1 == 1;
+    let queries: Vec<(u32, u32)> = raw.iter().map(|&(s, t)| (new[s], if reach(s, t) { new[t] } else { u32::MAX })).collect();
+    drop((new, has_in, target));
 
     // Queries sorted by renumbered source, one block per thread, so a thread's searches stay in one
     // part of the graph and touch only that part of its lazily zeroed distance table. A thread that
     // finishes its block helps with the others.
-    let q = map("/data/queries.txt");
-    let mut i = 0;
-    let mut queries = Vec::new();
-    while i < q.len() {
-        let (s, t) = (num(q, &mut i) as usize, num(q, &mut i) as usize);
-        // A target with no in-edges is answered -1 without searching, which avoids settling the
-        // whole graph; it is marked by a renamed target of u32::MAX.
-        let reach = s == t || has_in[t / 64].load(Relaxed) >> (t % 64) & 1 == 1;
-        queries.push((new[s], if reach { new[t] } else { u32::MAX }));
-    }
-    drop((new, has_in));
     let mut order: Vec<usize> = (0..queries.len()).collect();
     order.sort_unstable_by_key(|&j| queries[j].0);
     let blocks: Vec<&[usize]> = (0..k).map(|b| &order[order.len() * b / k..order.len() * (b + 1) / k]).collect();
