@@ -6,10 +6,7 @@ use std::thread;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
-    fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
 }
-
-const PR_SET_THP_DISABLE: i32 = 41;
 
 /// The whole file, read-only. /data is already in the page cache, so this costs no memory.
 fn map(path: &str) -> &'static [u8] {
@@ -144,9 +141,6 @@ fn search<D: Copy + Default + Into<u64> + TryFrom<u64>>(off: &[u32], adj: &[u64]
 }
 
 fn main() {
-    // No transparent huge pages: one would make a whole 2 MB stretch of a thread's lazily zeroed
-    // distance table count when a search touches any of it.
-    unsafe { prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) };
     let g = map("/data/graph.txt");
     let mut i = 0;
     let (n, m) = (num(g, &mut i) as usize, num(g, &mut i) as usize);
@@ -272,18 +266,15 @@ fn main() {
     while i < q.len() {
         queries.push((num(q, &mut i) as usize, num(q, &mut i) as usize));
     }
-    // Each query's ends in the new numbering; then the numbering itself is no longer needed.
-    let renamed: Vec<(usize, usize)> = queries.iter().map(|&(s, t)| (new[s] as usize, new[t] as usize)).collect();
-    drop(new);
     let mut order: Vec<usize> = (0..queries.len()).collect();
-    order.sort_unstable_by_key(|&j| renamed[j].0);
+    order.sort_unstable_by_key(|&j| new[queries[j].0]);
     let blocks: Vec<&[usize]> = (0..k).map(|b| &order[order.len() * b / k..order.len() * (b + 1) / k]).collect();
     let taken: Vec<AtomicUsize> = (0..k).map(|_| AtomicUsize::new(0)).collect();
     let answers: Vec<AtomicU64> = queries.iter().map(|_| AtomicU64::new(0)).collect();
     let wide = std::sync::Mutex::new(Vec::new());
     thread::scope(|s| {
         for me in 0..k {
-            let (blocks, taken, queries, renamed, answers, wide, off, adj, has_in) = (&blocks, &taken, &queries, &renamed, &answers, &wide, &off, &adj, &has_in);
+            let (blocks, taken, queries, answers, wide, off, adj, new, has_in) = (&blocks, &taken, &queries, &answers, &wide, &off, &adj, &new, &has_in);
             s.spawn(move || {
                 // Distances fit in 32 bits except near the few edges of weight about 2^32; only
                 // those searches are redone, one at a time, over a shared 64-bit table.
@@ -291,7 +282,7 @@ fn main() {
                 for b in (0..k).map(|x| (me + x) % k) {
                     while let Some(&j) = blocks[b].get(taken[b].fetch_add(1, Relaxed)) {
                         let (src, t) = queries[j];
-                        let (s, t2) = renamed[j];
+                        let (s, t2) = (new[src] as usize, new[t] as usize);
                         let d = if src == t {
                             0
                         } else if has_in[t / 64].load(Relaxed) >> (t % 64) & 1 == 0 {

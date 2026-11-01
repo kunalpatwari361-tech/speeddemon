@@ -39,3 +39,5 @@ Grouping exact duplicate queries (full hash correct) was also dropped: the candi
 A chunked decimal parser with 64-bit delimiter detection matched the full hash. In two separate 8-pair batches, baseline-to-parser medians were 2.552 s to 2.317 s, then 1.543 s to 1.553 s; it was faster in 5 of 8 pairs in each batch but did not show a repeatable median gain. It adds about 32 Rust code lines, so it was dropped.
 
 PGO trained on full data from seed 2 and seed 1 both matched the full hash. Seed 2 was slower in the 8-pair comparison (median 3.065 s versus 2.888 s); seed 1 was effectively tied (1.637 s versus 1.641 s, 4 of 8 pairs faster). Neither profile was retained. All these Windows Docker timings varied widely and are local experiments, not board results.
+
+Locked in for the freeze: the source is back to the step-2 version (the radix heap, as measured by run-4c7a04395e32). Every run after step 3 measured 0.386 to 0.393 s against 0.342 s for step 2, so step 3's 4 MiB saving is not worth the doubt.
