@@ -9,6 +9,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 2 | Field ends from AVX2 bitmasks (quotes prefix-xored mark the bytes inside quotes); numbers parsed 8 digits at once; names hashed 8 bytes at a time | run-8b6e18ce9bbe | 0.0595 | 11.3 | 71.61 |
 | 3 | The region table freed before the parse; no transparent huge pages | run-d3822c6b0947 | 0.0593 | 9.9 | 72.17 |
 | 3, rerun | The same Track C code, run again on a later commit (03d11db) | run-016234f2ccc9 | 0.0589 | 9.5 | 72.44 |
+| 4 | Profile-guided build, with a byte-identical copy of the published generator (e95c13d) | run-3815089f02e8 | 0.0573 | 9.8 | 72.48 |
+| 5 | Each country's name bits owned by one thread and set with plain stores after each of 64 pieces, instead of an atomic fetch_or per record; 299 to 320 code lines (9898558) | run-5a82e375abf8 | 0.0562 | 10.1 | 72.31 |
 
 M is the board's peak memory in MB (10^6 bytes); step 3 was read from the board in MiB and converted.
 
@@ -51,3 +53,5 @@ Profile-guided build again, now with the generator byte-identical to the publish
 Where a run goes (laptop, 15 interleaved full runs, medians): the whole run 129 ms; without setting the name bits 88 ms; without the name lookup either 67 ms. Setting the bits, an atomic fetch_or per record on the 3.9 MB of per-country bitsets (240 countries), was the largest part. A slot holding the name's hash and all its country bits in one 64-byte line (8 MB in all) did not help: 16 paired runs, median 172 to 171 ms, faster in 5/16, peak 8 to 9 MB against 12 to 13 MB. Dropped.
 
 Kept: each country's bits are owned by one thread (rank modulo the thread count). Each thread parses its records in pieces; after each piece the bit indexes go to their owners, and after a barrier each owner sets its bits with plain stores. All four datasets matched. The laptop's two core types make a barrier wait for the slowest core, so wall time there was mixed (16 paired runs, 108 to 115 ms median, faster in 9/16); pinned to the 8 efficiency cores, 12 paired runs: 171 to 103 ms, faster in 10/12; on the 2 performance cores (4 threads): 204 to 176 ms, faster in 8/12. Total CPU time, which barrier waits do not add to, on the 8 efficiency cores: 793 ms to 615 ms with 16 pieces per thread (lower in 11/12) and 648 ms with 64 (10/12); a second set of 10: 629 ms against 493 with 32 and 485 with 64. Peak memory: 8 to 9 MB before, 10 to 13 MB with 16 or 32 pieces (the hand-off buffers), 9 MB with 64. Kept with 64 pieces.
+
+On the board (step 5), the first run measured 0.0562 s, under the profile-guided build's 0.0573 s, but the 21 more code lines cost about 0.2 points, so it scored 72.31. In the same board run the unchanged Tracks A, B and D measured 6 to 20% slower than their usual times.
