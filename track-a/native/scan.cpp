@@ -81,7 +81,6 @@ void scan(const uint8_t* b, size_t from, size_t to, uint64_t base, std::atomic<u
         for (;;) {
             uint64_t x = load64(b + j);
             size_t n = word_len(x);
-            if (n == 0) break;  // endpoint ended exactly on an 8-byte boundary
             uint64_t keep = n == 8 ? ~0ull : (1ull << (8 * n)) - 1;
             hash = (hash ^ (x & keep)) * K;
             hash = (hash << 23) | (hash >> 41);
