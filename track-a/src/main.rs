@@ -276,16 +276,17 @@ fn main() {
                         out.extend_from_slice(text.as_bytes());
                         out.push(b' ');
                         out.extend_from_slice(name);
-                        for x in [
-                            n,
-                            p50 as usize,
-                            p95 as usize,
-                            p99 as usize,
-                            e,
-                            e * 1_000_000 / n,
-                        ] {
+                        for x in [n, p50 as usize, p95 as usize, p99 as usize] {
                             out.push(b' ');
                             push_num(&mut out, x);
+                        }
+                        if e == 0 {
+                            out.extend_from_slice(b" 0 0");
+                        } else {
+                            out.push(b' ');
+                            push_num(&mut out, e);
+                            out.push(b' ');
+                            push_num(&mut out, e * 1_000_000 / n);
                         }
                         out.push(b'\n');
                     }
