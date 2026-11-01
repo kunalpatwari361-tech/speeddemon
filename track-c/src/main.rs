@@ -40,48 +40,20 @@ fn num(b: &[u8], i: &mut usize) -> u64 {
 
 /// Bitmasks of the quotes, and of the commas and LFs, among the 64 bytes of b from i (zeros past
 /// its end), from 32-byte compares. The build targets the scoring CPU, which has AVX2.
-#[cfg(target_arch = "x86_64")]
 fn masks(b: &[u8], i: usize) -> (u64, u64) {
     use std::arch::x86_64::*;
-
     let mut tail = [0u8; 64];
     let block = b.get(i..i + 64).unwrap_or_else(|| {
         tail[..b.len() - i].copy_from_slice(&b[i..]);
         &tail
     });
-
     unsafe {
-        let half = |k: usize| {
-            _mm256_loadu_si256(block.as_ptr().add(32 * k) as *const __m256i)
-        };
+        let half = |k: usize| _mm256_loadu_si256(block.as_ptr().add(32 * k) as *const __m256i);
         let (lo, hi) = (half(0), half(1));
-        let is = |v: __m256i, c: u8| {
-            _mm256_movemask_epi8(
-                _mm256_cmpeq_epi8(v, _mm256_set1_epi8(c as i8))
-            ) as u32 as u64
-        };
-        let both = |c: u8| is(lo, c) | (is(hi, c) << 32);
+        let is = |v: __m256i, c: u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c as i8))) as u32 as u64;
+        let both = |c: u8| is(lo, c) | is(hi, c) << 32;
         (both(b'"'), both(b',') | both(b'\n'))
     }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn masks(b: &[u8], i: usize) -> (u64, u64) {
-    let mut quotes = 0u64;
-    let mut separators = 0u64;
-
-    for j in 0..64 {
-        let c = b.get(i + j).copied().unwrap_or(0);
-
-        if c == b'"' {
-            quotes |= 1u64 << j;
-        }
-        if c == b',' || c == b'\n' {
-            separators |= 1u64 << j;
-        }
-    }
-
-    (quotes, separators)
 }
 
 /// Bit k of the result is the parity of bits 0..=k of x.
