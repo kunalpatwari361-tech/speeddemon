@@ -104,14 +104,16 @@ fn bucket(d: u64, last: u64) -> usize {
 }
 
 /// Dijkstra from s, stopping when t is settled, over a zeroed table of D holding distance + 1
-/// (0 is unreached). None if a distance does not fit in D. Leaves the table zeroed again.
+/// (0 is unreached). If the target cannot be reached within D, returns None for a wider retry.
+/// Leaves the table zeroed again.
 fn search<D: Copy + Default + Into<u64> + TryFrom<u64>>(off: &[u32], adj: &[u64], dist: &mut [D], seen: &mut Vec<usize>, heap: &mut RadixHeap, s: usize, t: usize) -> Option<i64> {
     heap.clear();
     heap.push(0, s as u32);
     dist[s] = D::try_from(1).ok()?;
     seen.push(s);
     let mut found = Some(-1);
-    'search: while let Some((d, u)) = heap.pop() {
+    let mut too_wide = false;
+    while let Some((d, u)) = heap.pop() {
         let u = u as usize;
         if d + 1 > dist[u].into() {
             continue;
@@ -123,8 +125,8 @@ fn search<D: Copy + Default + Into<u64> + TryFrom<u64>>(off: &[u32], adj: &[u64]
         for &e in &adj[off[u] as usize..off[u + 1] as usize] {
             let (v, nd) = ((e >> 32) as usize, d + (e & 0xffff_ffff));
             let Ok(x) = D::try_from(nd + 1) else {
-                found = None;
-                break 'search;
+                too_wide = true;
+                continue;
             };
             let old: u64 = dist[v].into();
             if old == 0 || nd + 1 < old {
@@ -137,7 +139,7 @@ fn search<D: Copy + Default + Into<u64> + TryFrom<u64>>(off: &[u32], adj: &[u64]
         }
     }
     seen.drain(..).for_each(|v| dist[v] = D::default());
-    found
+    if too_wide && found == Some(-1) { None } else { found }
 }
 
 fn main() {
@@ -276,9 +278,9 @@ fn main() {
         for me in 0..k {
             let (blocks, taken, queries, answers, wide, off, adj, new, has_in) = (&blocks, &taken, &queries, &answers, &wide, &off, &adj, &new, &has_in);
             s.spawn(move || {
-                // Distances fit in 32 bits except near the few edges of weight about 2^32; only
-                // those searches are redone, one at a time, over a shared 64-bit table.
-                let (mut dist, mut seen, mut heap) = (vec![0u32; n], Vec::new(), RadixHeap::new());
+                // Most answers fit in 16 bits. Search within that exact bound first; queries
+                // whose target is not settled there are retried against the shared 64-bit table.
+                let (mut dist, mut seen, mut heap) = (vec![0u16; n], Vec::new(), RadixHeap::new());
                 for b in (0..k).map(|x| (me + x) % k) {
                     while let Some(&j) = blocks[b].get(taken[b].fetch_add(1, Relaxed)) {
                         let (src, t) = queries[j];
