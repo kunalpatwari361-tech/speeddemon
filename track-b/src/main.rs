@@ -286,7 +286,7 @@ fn eval<'a>(steps: &[(u8, u32)], set: impl Fn(u32) -> Set<'a>, r: &mut [u64], v:
 }
 
 /// The documents are indexed and queried in this many rounds, so only one round's postings are held.
-const ROUNDS: usize = 12;
+const ROUNDS: usize = 8;
 
 fn main() {
     // No transparent huge pages: one would back a mostly untouched stretch of a lazily filled array,
