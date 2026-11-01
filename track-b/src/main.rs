@@ -251,13 +251,20 @@ fn eval<'a>(steps: &[(u8, u32)], set: impl Fn(u32) -> Set<'a>, r: &mut [u64], v:
             (b'=', Set::Bits(b), _) => (r.copy_from_slice(b), dense = true).0,
             (_, Set::Bits(b), false) if op != b'O' => v.retain(|&d| has(b, d) == (op == b'A')),
             (_, Set::Ids(a), false) if op != b'O' => {
+                // Gallop: steps of 1, 2, 4, ... past the ids below d, then a binary search in the last step.
                 let mut i = 0;
                 v.retain(|&d| {
-                    i += a[i..].iter().take_while(|&&x| x < d).count();
+                    let mut step = 1;
+                    while i + step < a.len() && a[i + step] < d {
+                        i += step;
+                        step *= 2;
+                    }
+                    i += a[i..(i + step + 1).min(a.len())].partition_point(|&x| x < d);
                     (a.get(i) == Some(&d)) == (op == b'A')
                 });
             }
-            (_, Set::Ids(a), false) => (v.extend_from_slice(a), v.sort_unstable(), v.dedup()).0,
+            // Two ascending runs: the stable sort finds them and merges them in one pass.
+            (_, Set::Ids(a), false) => (v.extend_from_slice(a), v.sort(), v.dedup()).0,
             (_, Set::Bits(b), false) => {
                 r.copy_from_slice(b);
                 v.iter().for_each(|&d| r[d as usize / 64] |= 1 << (d % 64));
@@ -441,7 +448,7 @@ fn main() {
             for (block, acc) in queries.chunks(chunk).zip(acc.chunks_mut(chunk)) {
                 let (set, end, steps) = (&set, &end, &steps);
                 s.spawn(move || {
-                    let (mut r, mut v, mut phrase) = (vec![0u64; words], Vec::new(), Vec::new());
+                    let (mut r, mut v, mut phrase, mut toks) = (vec![0u64; words], Vec::new(), Vec::new(), Vec::new());
                     for (&[from, to, at, stop], (count, sum, ten)) in block.iter().zip(acc) {
                         eval(&steps[from as usize..to as usize], set, &mut r, &mut v);
                         if to - from > 1 && stop > at {
@@ -452,7 +459,8 @@ fn main() {
                                 let d = d0 + d as usize;
                                 let line = if d == 0 { 0 } else { end[d - 1].load(Relaxed) as usize + 1 };
                                 let tab = line + docs[line..].iter().position(|&c| c == b'\t').unwrap();
-                                let toks: Vec<&[u8]> = tokens(&docs[tab + 1..end[d].load(Relaxed) as usize]).collect();
+                                toks.clear();
+                                toks.extend(tokens(&docs[tab + 1..end[d].load(Relaxed) as usize]));
                                 toks.windows(phrase.len()).any(|w| w.iter().zip(&phrase).all(|(a, b)| a.eq_ignore_ascii_case(b)))
                             });
                         }
