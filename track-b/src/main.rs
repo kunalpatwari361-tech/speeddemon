@@ -286,14 +286,24 @@ fn has(bits: &[u64], d: u32) -> bool {
     bits[d as usize / 64] >> (d % 64) & 1 == 1
 }
 
+/// The operators a step can hold, by the two bits it keeps them in.
+const OPS: [u8; 4] = *b"=AON";
+
+/// A step: the operator's index in OPS in bits 29 and 30, under a pair id's top bit; ids stay far
+/// below 2^29.
+fn step(op: u8, id: u32) -> u32 {
+    (OPS.iter().position(|&o| o == op).unwrap() as u32) << 29 | id
+}
+
 /// Evaluates (operator, id) steps left to right into v, as ascending ids: '=' load, 'A' and,
 /// 'O' or, 'N' and-not, with set(id) an id's documents. The result is held as the bitset r instead
 /// only while loading or ORing in a common term has made it large; an AND with ids makes it a list
 /// again. An empty list with no OR still to come is the answer, and the other steps are not read.
-fn eval<'a>(steps: &[(u8, u32)], set: impl Fn(u32) -> Set<'a>, r: &mut [u64], v: &mut Vec<u32>) {
+fn eval<'a>(steps: &[u32], set: impl Fn(u32) -> Set<'a>, r: &mut [u64], v: &mut Vec<u32>) {
     let mut dense = false;
-    for (i, &(op, id)) in steps.iter().enumerate() {
-        if i > 0 && !dense && v.is_empty() && steps[i..].iter().all(|s| s.0 != b'O') {
+    for (i, &s) in steps.iter().enumerate() {
+        let (op, id) = (OPS[(s >> 29 & 3) as usize], s & !(3 << 29));
+        if i > 0 && !dense && v.is_empty() && steps[i..].iter().all(|&s| OPS[(s >> 29 & 3) as usize] != b'O') {
             break;
         }
         match (op, set(id), dense) {
@@ -367,13 +377,13 @@ fn main() {
             if phrase {
                 let c = terms.add(token(w, 0).1 | 1);
                 if let Some(p) = prev {
-                    (_, op) = (steps.push((op, pairs.add(pair(p, c)) | 1 << 31)), b'A');
+                    (_, op) = (steps.push(step(op, pairs.add(pair(p, c)) | 1 << 31)), b'A');
                 }
                 prev = Some(c);
             } else if j % 2 == 1 {
                 op = w[0];
             } else {
-                steps.push((op, terms.add(token(w, 0).1 | 1)));
+                steps.push(step(op, terms.add(token(w, 0).1 | 1)));
             }
         }
         let at = if phrase { (rest.as_ptr() as usize - q.as_ptr() as usize) as u32 } else { 0 };
