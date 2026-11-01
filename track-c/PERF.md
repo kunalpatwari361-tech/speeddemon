@@ -36,6 +36,7 @@ Where the parse's time goes now (laptop, full scale, 10 interleaved runs each, s
 |---|---|---|---|
 | Name table of 32-bit tags (512 KB) instead of 64-bit hashes (1 MB), so it stays in cache beside the bitsets | 135 → 144 | 7 of 20 | no, no gain, and two names would merge about once in 7,000 runs |
 | Non-temporal prefetch of the records 512 bytes ahead, so the stream does not push the name table and the bitsets out of the caches | 150 → 173 | 9 of 20 | no, no gain |
+| The 32-bit name table again, on the PGO build (three sessions of 12, 16 and 20 pairs) | 80 → 78, 73 → 70, 88 → 83 | 29 of 48 | no: peak 8 MB in 16 of 20 runs against 8 to 9 MB, but no reliable time gain, and the merge risk stands |
 
 ## Local full-data experiments (not board runs)
 
