@@ -6,6 +6,7 @@ use std::thread;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn mallopt(param: i32, value: i32) -> i32;
 }
 
 /// The whole file, read-only. /data is already in the page cache, so this costs no memory.
@@ -142,7 +143,12 @@ fn search<D: Copy + Default + Into<u64> + TryFrom<u64>>(off: &[u32], adj: &[u64]
     if too_wide && found == Some(-1) { None } else { found }
 }
 
+const M_MMAP_THRESHOLD: i32 = -3;
+
 fn main() {
+    // A block of 64 KB or more is its own mapping, given back when freed. Otherwise the allocator raises
+    // its threshold after the first large free and keeps later large blocks, such as the edge lists.
+    unsafe { mallopt(M_MMAP_THRESHOLD, 64 << 10) };
     let g = map("/data/graph.txt");
     let mut i = 0;
     let (n, m) = (num(g, &mut i) as usize, num(g, &mut i) as usize);
