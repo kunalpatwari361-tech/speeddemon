@@ -111,6 +111,7 @@ fn money(c: i64) -> String {
 }
 
 const SLOT_BITS: u32 = 17; // the name pool is 100,000 values: 2^17 slots, 76% full
+const AHEAD: usize = 16; // records between a name's prefetch and its lookup
 
 #[derive(Clone, Copy)]
 struct Agg {
@@ -152,10 +153,13 @@ fn main() {
     let seen: Vec<AtomicU64> = zeroed((unmatched + 1) << (SLOT_BITS - 6));
     // A slot holds a name's 64-bit hash, which identifies it among the 100,000 (a collision is
     // about 1 in 4 billion).
-    let slot_of = |at: usize, len: usize| {
+    let hash_of = |at: usize, len: usize| {
         let chunk = |k: usize| load(b, at + k) & ((1u128 << (8 * (len - k).min(8))) - 1) as u64;
-        let hash = (0..len).step_by(8).fold(len as u64, |h, k| (h ^ chunk(k)).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29)) | 1;
-        let mut s = (hash.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - SLOT_BITS)) as usize;
+        (0..len).step_by(8).fold(len as u64, |h, k| (h ^ chunk(k)).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29)) | 1
+    };
+    let home = |hash: u64| (hash.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - SLOT_BITS)) as usize;
+    let slot_of = |hash: u64| {
+        let mut s = home(hash);
         loop {
             match slots[s].load(Relaxed) {
                 v if v == hash => return s,
@@ -179,9 +183,19 @@ fn main() {
         let hs: Vec<_> = cut
             .windows(2)
             .map(|w| {
-                let (group, seen, slot_of) = (&group, &seen, &slot_of);
+                let (group, seen, slots, hash_of, home, slot_of) = (&group, &seen, &slots, &hash_of, &home, &slot_of);
                 s.spawn(move || {
                     let mut agg = vec![empty; unmatched + 1];
+                    // A record's name is hashed when it is parsed, and its home slot and that slot's
+                    // bit for the group are prefetched; the lookup and the bit wait AHEAD records.
+                    let fetch = |p: *const AtomicU64| unsafe { std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+                    let mark = |hash: u64, g: usize| {
+                        let bit = g << SLOT_BITS | slot_of(hash);
+                        if seen[bit / 64].load(Relaxed) >> (bit % 64) & 1 == 0 {
+                            seen[bit / 64].fetch_or(1 << (bit % 64), Relaxed);
+                        }
+                    };
+                    let (mut ring, mut n) = ([(0u64, 0usize); AHEAD], 0usize);
                     // A record's fields end at commas and its LF, the ones outside quotes. In each
                     // 64-byte block the quote bits, prefix-xored, mark the bytes inside quotes, and
                     // the quotes counted up to a field's end give its quote count.
@@ -220,10 +234,14 @@ fn main() {
                                     a.max = a.max.max(cents);
                                     a.name_bytes += name.2;
                                     a.note_bytes += note_len;
-                                    let bit = g << SLOT_BITS | slot_of(name.0, name.1);
-                                    if seen[bit / 64].load(Relaxed) >> (bit % 64) & 1 == 0 {
-                                        seen[bit / 64].fetch_or(1 << (bit % 64), Relaxed);
+                                    let hash = hash_of(name.0, name.1);
+                                    fetch(&slots[home(hash)]);
+                                    fetch(&seen[(g << SLOT_BITS | home(hash)) / 64]);
+                                    if n >= AHEAD {
+                                        let (h, g) = ring[n % AHEAD];
+                                        mark(h, g);
                                     }
+                                    (ring[n % AHEAD], n) = ((hash, g), n + 1);
                                 }
                             }
                             (start, field_quotes, field) = (p + 1, before, (field + 1) % 5);
@@ -233,6 +251,10 @@ fn main() {
                         }
                         quotes += q.count_ones();
                         at += 64;
+                    }
+                    for j in n.saturating_sub(AHEAD)..n {
+                        let (h, g) = ring[j % AHEAD];
+                        mark(h, g);
                     }
                     agg
                 })
