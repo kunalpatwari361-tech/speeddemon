@@ -9,6 +9,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 2 | Packed radix heap for the search, its buckets kept between queries | run-4a3cd5f77eb4 | 0.3426 | 147.3 | 59.36 |
 | 2, rerun | The same Track D code, run again on a later commit (d837159) | run-4c7a04395e32 | 0.3416 | 147.4 | 59.38 |
 | 3 | The old-to-new numbering freed before the searches; no transparent huge pages | run-4acff2494398 | 0.3901 | 142.7 | 58.01 |
+| 4 | The graph read three times so that one edge array is held; smaller search bookkeeping, with 16-bit distances (582d280) | run-7374ed691056 | 0.3826 | 105.7 | 59.72 |
+| 5 | The second read stores head and weight together, and each region copies its rows, renamed, instead of a third read; in-edges marked only for query targets (f70c04e) | run-089598c630c2 | 0.3336 | 111.4 | 60.79 |
 
 M is the board's peak memory in MB (10^6 bytes); steps 1 and 3 were read from the board in MiB and converted. Step 3's time is within the spread the same code shows from run to run on the board (0.342 to 0.448 s).
 
@@ -55,3 +57,11 @@ Where the time goes in the three-read build (laptop, full scale, phase timers, o
 | The second read stores head and weight together; after renumbering, each region copies its nodes' rows, renamed, into its own stretch of the final array, instead of a third read placing every edge with an atomic cursor | 8 rounds: wall 648 to 520 ms (faster 8/8), CPU 6.6 to 5.4 s (less 8/8) | 98 to 106 MiB: the old and new edge arrays are held together while copying | Kept |
 | The queries read first, so the first read marks in-edges only for query targets: an L2-sized lookup per edge instead of a locked OR on a bitset every thread writes | on top of the row above, 8 rounds: wall 597 to 563 ms (6/8), CPU 6.1 to 5.8 s (6/8) | unchanged | Kept |
 | Both, against the three-read build | 10 rounds: wall 588 to 462 ms (9/10), CPU 6.0 to 4.8 s (9/10) | median 98 to 106 MiB | Output matched on all four datasets |
+
+Tried after f70c04e, not kept:
+
+| Change | Paired full runs | Peak | Decision |
+|---|---|---|---|
+| Copy by old-id ranges, each row written to its new place, so the region lists are freed before the copy | 10 rounds: wall 567 to 585 ms (faster 3/10) | 106 to 99 MiB | Dropped: the memory saved is worth about as much as the time lost |
+| No atomics in the two reads: each part counts out-degrees in its own 16-bit table, the counts become per-part offsets within each node, and the second read places edges with plain writes | 10 rounds: wall 731 to 831 ms (faster 0/10) | unchanged | Dropped: twelve 3.5 MB tables, each read at random, miss the cache more than one shared table of atomic counters |
+| One read of the graph into k buckets of edge triples by tail, so each thread counts out-degrees and lays out its own nodes' rows without atomics, within a small stretch of memory | 20 rounds in two batches: wall 597 to 530 ms and 537 to 514 ms (faster 14/20), CPU 6.2 to 5.4 s and 5.5 to 5.1 s | 106 to about 110 MiB: the buckets and the edge array are held together while placing | Dropped: about 4 to 11% faster, but 34 more code lines (330 to 364) and the memory take most of it back |

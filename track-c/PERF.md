@@ -11,6 +11,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 3, rerun | The same Track C code, run again on a later commit (03d11db) | run-016234f2ccc9 | 0.0589 | 9.5 | 72.44 |
 | 4 | Profile-guided build, with a byte-identical copy of the published generator (e95c13d) | run-3815089f02e8 | 0.0573 | 9.8 | 72.48 |
 | 5 | Each country's name bits owned by one thread and set with plain stores after each of 64 pieces, instead of an atomic fetch_or per record; 299 to 320 code lines (9898558) | run-5a82e375abf8 | 0.0562 | 10.1 | 72.31 |
+| 6 | On step 4: a record's name hashed when parsed, its home slot and that slot's bit word prefetched, the lookup and the atomic bit done 16 records later; 299 to 325 code lines (c22f5d8) | run-9047c9ca3594 | 0.0531 | 9.9 | 72.98 |
+| 7 | `regions.csv` read on all threads, in two passes over its lines; 325 to 333 code lines (810b4c8) | run-df6f817a5259 | 0.0472 | 9.8 | 74.21 |
 
 M is the board's peak memory in MB (10^6 bytes); step 3 was read from the board in MiB and converted.
 
@@ -77,3 +79,10 @@ Also tried on the prefetching build, not kept (paired full runs; all matched on 
 | Records parsed in batches of 64 with each one's group byte, name slot and bit word prefetched, then looked up and set, in place of the 16-ahead ring (the group byte was the top cost, 21% of samples) | 4 performance threads: wall 102 to 100 ms (8/12), CPU 347 to 340 ms (9/12); 19 more lines |
 | The batches plus MAP_POPULATE plus the parallel `regions.csv` | 4 performance threads: wall 102 to 93 ms (9/12), CPU 347 to 312 ms (9/12); all threads: 61 to 62 ms (5/15); 37 more lines |
 | Prefix-xor as one carry-less multiply | faster in 7/15 |
+
+Tried after the parallel `regions.csv` (f70c04e), not kept. With the 4 performance threads only, closest to the board, the group-byte lookup was the top cost, at 27% of samples.
+
+| Change | Result |
+|---|---|
+| Group bytes kept small enough for the cache: one per region in id order (200 KB), found through a bit per region id with each 64 ids' count of regions before them (250 KB) | same output and peak; the two lookups still took 25% of samples; 4 performance threads faster in 9/15, all threads in 6/15 |
+| The name table, the bitsets and the group bytes on 2 MB pages (MADV_HUGEPAGE, in place of turning huge pages off), so their random lookups miss the TLB less | peak 8 to 12 MiB on 4 threads, 9 to 13 MiB on all; faster in 8/12 and 5/12 |
