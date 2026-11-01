@@ -8,6 +8,12 @@ Every step from the reference to your final version, each with the live-board ru
 | 1 | One scan indexes only the query terms and adjacent query-term pairs: common ids as bitsets, the rest as posting lists placed from per-thread hit streams | run-20244f1c82c7 | 0.4071 | 199.4 | 58.98 |
 | 2 | Rounds: the documents are indexed and queried an eighth at a time, so only one round's postings are held | run-00de16a83ce2 | 0.4271 | 72.4 (69.0 MiB) | 62.57 |
 | 3 | A rare id reported once per document, no per-id state; query tables sized from the queries; tokens found and hashed 8 bytes at a time (three commits, measured together) | run-73886d267709 | 0.4309 | 62.2 | 63.07 |
+| 4 | Less memory during the rounds: one step list for all queries, 16-bit cursors, 32-bit bitset indexes, document ends only, compacted tables, no transparent huge pages | run-aaa7db0a16f5 | 0.3748 | 34.9 | 65.73 |
+| 5 | Twelve rounds instead of eight | run-58d4e30251c5 | 0.3898 | 31.3 | 65.30 |
+| 6 | A query stops once its result is empty with no OR to come (measured at twelve rounds) | run-a4766cffac8b | 0.4526 | 29.3 | 63.70 |
+| 7 | Eight rounds again, with step 6 and a 128 KB two-bit filter in front of the tables (28fa01c, whose own run is no longer in the board data) | run-20d1c6cd1af2 | 0.3730 | 36.5 | 65.80 |
+
+M is the board's peak memory in MB (10^6 bytes); steps 2, 4, 5 and 6 were read from the board in MiB and converted. The same Track B code has measured from 0.373 to 0.453 s on the board, so a single run cannot show a time change of a few percent; the memory figures are steady.
 
 ## Local experiments after step 1
 

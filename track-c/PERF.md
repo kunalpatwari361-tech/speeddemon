@@ -6,6 +6,11 @@ Every step from the reference to your final version, each with the live-board ru
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 14.44 | 367 | 0 |
 | 1 | Parts parsed in parallel into per-part totals per country; a quoted field's end found 8 bytes at a time; distinct names marked in one bitset per country over a shared name table | run-af0ccced31f5 | 0.0651 | 11.4 | 71.11 |
+| 2 | Field ends from AVX2 bitmasks (quotes prefix-xored mark the bytes inside quotes); numbers parsed 8 digits at once; names hashed 8 bytes at a time | run-8b6e18ce9bbe | 0.0595 | 11.3 | 71.61 |
+| 3 | The region table freed before the parse; no transparent huge pages | run-d3822c6b0947 | 0.0593 | 9.9 | 72.17 |
+| 3, rerun | The same Track C code, run again on a later commit (03d11db) | run-016234f2ccc9 | 0.0589 | 9.5 | 72.44 |
+
+M is the board's peak memory in MB (10^6 bytes); step 3 was read from the board in MiB and converted.
 
 ## Local experiments after step 1
 

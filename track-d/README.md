@@ -12,6 +12,8 @@ Node ids are a random relabelling, so a search would jump all over memory. Befor
 
 Queries are sorted by renumbered source and cut into one block per thread, so a thread's searches stay in one part of the graph and touch only that part of its lazily zeroed distance table; a thread that finishes its block helps with the others. Each query is a Dijkstra search that stops when the target is settled. The heap is a radix heap over distances, which never fall below the last one popped, so each entry is one 64-bit word holding its distance and node. Each thread keeps the heap's buckets between queries. Each thread keeps 32-bit distances (0 meaning unreached), which halves its table; searches that exceed this range are redone, one at a time, over a shared 64-bit table. A target with no in-edges is answered `-1` without searching, which avoids settling the whole graph.
 
+The process asks for no transparent huge pages, so each thread's distance table counts only the pages its searches touch, and the old-to-new numbering is freed once the queries are renamed.
+
 The binary is built for the scoring CPU (`target-cpu=native`).
 
 ## Dependencies

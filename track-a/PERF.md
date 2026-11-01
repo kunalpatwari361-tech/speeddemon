@@ -6,8 +6,15 @@ Every step from the reference to your final version, each with the live-board ru
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 32.05 | 228 | 0 |
 | 1 | Two passes: count, then place each latency; output streamed by hour | run-44123151dbca | 0.0628 | 33.3 | 70.99 |
-| 2 | One scan into per-hour chunks; each hour counted, placed and formatted in cache, with no layout pass | run-895db16cd9de | 0.0332 | 36.6 | 76.29 |
-| 3 | Nested selection for the percentiles; chunks as 4 KB pages from one arena per part, given back per hour (measured on commit 2e67c3e, which has them) | run-c8c29b53bf85 | 0.0316 | 36.2 | 76.68 |
+| 2 | The line scanner in C++ (word-at-a-time space search, endpoint hash 8 bytes at a time), layout and output in Rust | run-382acfea3b49 | 0.0495 | 35.5 | 72.45 |
+| 3 | One scan into per-hour chunks; each hour counted, placed and formatted in cache, with no layout pass | run-895db16cd9de | 0.0332 | 36.6 | 76.29 |
+| 4 | Nested selection for the percentiles; chunks as 4 KB pages from one arena per part, given back per hour (measured on commit 2e67c3e, which has them) | run-c8c29b53bf85 | 0.0316 | 36.2 | 76.68 |
+| 5 | The chunk arena refuses transparent huge pages, so a finished hour's pages really go back | run-557e5bbdbd84 | 0.0305 | 27.9 | 78.17 |
+| 6 | An hour's chunk pages go back as soon as its latencies are placed, before formatting | run-b12eb0f51019 | 0.0304 | 25.9 | 78.53 |
+| 7 | One 4-byte record per line: endpoint slot, 5xx bit, overflow bit, 18-bit latency or overflow index | run-f39affb61c4b | 0.0309 | 23.7 | 78.68 |
+| 7, rerun | The same Track A code, run again on a later commit (9013f4d) | run-f904aa268b33 | 0.0309 | 20.7 | 79.28 |
+
+M is the board's peak memory in MB (10^6 bytes); steps 5 to 7 were read from the board in MiB and converted. The board's timing varies by several percent between runs of the same code, as the two runs of step 7 show.
 
 ## Experiments on the laptop (not board runs)
 
@@ -33,7 +40,7 @@ Later experiments, each run interleaved against the build before it:
 | Endpoint lookup cost: full lookup, hashing without the table, a byte search for the endpoint's end | parse | scan 29 to 46, 24 to 50 and 31 to 63 ms over 6 runs each | Diagnostic: the lookup costs nothing measurable, so it is unchanged |
 | Why step 3's memory did not fall on the board: the arena asked for huge pages (madvise MADV_HUGEPAGE), as a kernel with transparent huge pages always on gives them | memory | peak 35.0 to 38.4 MB over 4 runs, as on the board (36.2); without huge pages (MADV_NOHUGEPAGE) 26.1 to 26.6 MB | The arena now refuses huge pages: a 2 MB page holds many hours' chunks, and giving back 4 KB of it only splits it later |
 
-The parse is about 60% of a laptop run. A bare newline count over the same bytes takes 7 to 8 ms, and the scan runs at two to three times that. Track A commits between rows 1 and 2 (0bcc05e, 5fbde5e, 695f577) have no rows: their board runs are no longer in the board data.
+The parse is about 60% of a laptop run. A bare newline count over the same bytes takes 7 to 8 ms, and the scan runs at two to three times that. Two earlier Track A versions, before row 1, were also measured: dc7aa80 as run-a452eefc5c14 (69.93 points) and 5fbde5e as run-12533a696726 (69.89 points).
 
 Memory, later: an hour's chunk pages go back as soon as its latencies are placed, before its lines are formatted, so they no longer overlap the 12 threads' hour buffers. Laptop, 8 runs each: peak 25.7 to 27.1 MB before (median about 26.1), 23.0 to 24.4 MB after in 7 of 8 runs (median about 23.7); time unchanged.
 

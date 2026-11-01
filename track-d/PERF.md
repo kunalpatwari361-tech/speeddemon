@@ -5,7 +5,12 @@ Every step from the reference to your final version, each with the live-board ru
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 72.69 | 893 | 0 |
-| 1 | Packed radix heap for the search, its buckets kept between queries | run-4a3cd5f77eb4 | 0.3426 | 147.3 | 59.36 |
+| 1 | Edges parsed in parallel into a compressed adjacency; nodes renumbered by parallel breadth-first regions for locality; queries sorted by source; Dijkstra with a binary heap, stopping at the target, over 32-bit distances | run-3bd4a30bbaf0 | 0.3808 | 131.9 | 59.21 |
+| 2 | Packed radix heap for the search, its buckets kept between queries | run-4a3cd5f77eb4 | 0.3426 | 147.3 | 59.36 |
+| 2, rerun | The same Track D code, run again on a later commit (d837159) | run-4c7a04395e32 | 0.3416 | 147.4 | 59.38 |
+| 3 | The old-to-new numbering freed before the searches; no transparent huge pages | run-4acff2494398 | 0.3901 | 142.7 | 58.01 |
+
+M is the board's peak memory in MB (10^6 bytes); steps 1 and 3 were read from the board in MiB and converted. Step 3's time is within the spread the same code shows from run to run on the board (0.342 to 0.448 s).
 
 ## Experiments on the laptop (not board runs)
 

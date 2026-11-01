@@ -14,6 +14,8 @@ The file is scanned once. Each line becomes one 4-byte record, appended to the c
 
 Endpoints are sorted by byte. Hours are then processed in parallel, in any order, since the log is not in time order. For an hour, one pass over its records counts each endpoint's requests and 5xx responses, and a second pass places each latency in its endpoint's run of one buffer that stays in cache. The nearest-rank percentiles are selected, not sorted: p50 in the whole run, then p95 among the values above it, and p99 among those above p95. The hours' lines are written in hour order as they finish, and an hour's chunk pages go back to the system as soon as its latencies are placed, adjacent pages in one call, so the output written to `/out` reuses that memory.
 
+The record arena refuses transparent huge pages: one 2 MB page would hold many hours' chunks, and giving back a finished hour's 4 KB pages would not lower the memory counted.
+
 The binary is built for the scoring CPU (`target-cpu=native`).
 
 ## Dependencies
