@@ -17,7 +17,7 @@ The corpus goes in 8 rounds of one block per hardware thread, each block startin
 
 A `BOOL` query is evaluated left to right. The result stays a sorted list of ids while it can: AND and NOT filter it, and an OR with another list merges into it. It moves to a bitset only to load or OR in a common term. Once the list is empty with no OR still to come, the answer is empty and the remaining steps are not read. A `PHRASE` of two terms is exactly the documents holding that adjacent pair. A longer phrase starts from the documents holding all of its pairs, which are very few, and checks each one's tokens for the whole sequence.
 
-The binary is built for the scoring CPU (`target-cpu=native`).
+The binary is built for the scoring CPU (`target-cpu=native`) with profile-guided optimisation: during the offline build, a byte-identical copy of the published generator (`generator.py`, seed 2) makes a full-size training dataset, the instrumented binary runs on it, and `llvm-profdata` guides the final build. The runtime image holds only the Rust executable.
 
 ## Dependencies
 
