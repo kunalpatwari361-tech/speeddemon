@@ -126,6 +126,41 @@ fn token(b: &[u8], mut i: usize) -> (usize, u64) {
     }
 }
 
+/// The hash token() gives the len-byte token at b[i]: one chunk per 8 bytes and a last chunk of the
+/// rest, which is empty when len is a multiple of 8.
+fn hash(b: &[u8], i: usize, len: usize) -> u64 {
+    (0..=len / 8).fold(0, |h, c| {
+        let n = (len - 8 * c).min(8);
+        let chunk = (load(b, i + 8 * c) | 0x20 * ONES) & ((1u128 << (8 * n)) - 1) as u64;
+        (h ^ chunk).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29)
+    })
+}
+
+/// Bitmasks of the ASCII letters and digits, and of the LFs, among the 64 bytes of b from i (zeros
+/// past its end), from 32-byte compares. The build targets the scoring CPU, which has AVX2. A byte
+/// of 0x80 or more is negative in a signed compare, so it is neither.
+fn masks(b: &[u8], i: usize) -> (u64, u64) {
+    use std::arch::x86_64::*;
+    let mut tail = [0u8; 64];
+    let block = b.get(i..i + 64).unwrap_or_else(|| {
+        tail[..b.len() - i].copy_from_slice(&b[i..]);
+        &tail
+    });
+    unsafe {
+        let set = |c: u8| _mm256_set1_epi8(c as i8);
+        let half = |k: usize| {
+            let v = _mm256_loadu_si256(block.as_ptr().add(32 * k) as *const __m256i);
+            let l = _mm256_or_si256(v, set(0x20));
+            let letter = _mm256_and_si256(_mm256_cmpgt_epi8(l, set(b'a' - 1)), _mm256_cmpgt_epi8(set(b'z' + 1), l));
+            let digit = _mm256_and_si256(_mm256_cmpgt_epi8(v, set(b'0' - 1)), _mm256_cmpgt_epi8(set(b'9' + 1), v));
+            let bits = |m: __m256i| _mm256_movemask_epi8(m) as u32 as u64;
+            (bits(_mm256_or_si256(letter, digit)), bits(_mm256_cmpeq_epi8(v, set(b'\n'))))
+        };
+        let ((a0, l0), (a1, l1)) = (half(0), half(1));
+        (a0 | a1 << 32, l0 | l1 << 32)
+    }
+}
+
 /// The key of the adjacent pair (a, b) of term ids.
 fn pair(a: u32, b: u32) -> u64 {
     (a as u64 + 1) << 32 | (b as u64 + 1)
@@ -194,22 +229,8 @@ impl Index<'_> {
                     f(doc, id, dense);
                 }
             };
-            let (mut j, mut prev) = (tab + 1, None);
-            loop {
-                // The next token or the LF, whichever comes first.
-                let x = load(b, j);
-                let lf = x ^ 0x0a * ONES;
-                let (a, z) = (alnum(x).trailing_zeros(), (lf.wrapping_sub(ONES) & !lf & HIGH).trailing_zeros());
-                if z < a {
-                    j += z as usize / 8;
-                    break;
-                }
-                if a == 64 {
-                    j += 8;
-                    continue;
-                }
-                let h;
-                (j, h) = token(b, j + a as usize / 8);
+            let mut prev = None;
+            let mut word = |h: u64| {
                 let cur = self.terms.get(h | 1);
                 if let Some((c, dense)) = cur {
                     hit((c, dense));
@@ -218,6 +239,34 @@ impl Index<'_> {
                     }
                 }
                 prev = cur.map(|(c, _)| c);
+            };
+            // The text 64 bytes at a time, from a byte that is not inside a token: a token starts at
+            // a letter or digit after a byte that is neither, and ends at the next byte that is
+            // neither. A token running past the block is read on its own, and the next block
+            // starts where it ends. The LF ends the document.
+            let mut j = tab + 1;
+            loop {
+                let (al, lf) = masks(b, j);
+                let stop = lf.trailing_zeros();
+                let mut starts = al & !(al << 1) & if stop == 64 { !0 } else { (1 << stop) - 1 };
+                let mut next = j + 64;
+                while starts != 0 {
+                    let s = starts.trailing_zeros();
+                    let e = s + (!al >> s).trailing_zeros();
+                    if e >= 64 {
+                        let h;
+                        (next, h) = token(b, j + s as usize);
+                        word(h);
+                        break;
+                    }
+                    word(hash(b, j + s as usize, (e - s) as usize));
+                    starts &= starts - 1;
+                }
+                if stop < 64 && next == j + 64 {
+                    j += stop as usize;
+                    break;
+                }
+                j = next;
             }
             end[doc as usize].store(j as u32, Relaxed);
             i = j + 1;
