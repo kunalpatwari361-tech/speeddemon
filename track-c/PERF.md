@@ -65,3 +65,15 @@ A portable fallback for `masks` on CPUs without x86-64 (f036636, merged in f725f
 Prefetching ahead: a record's name is hashed when it is parsed, its home slot and that slot's bit word for the group are prefetched, and the lookup and the atomic bit are done 16 records later, so several records' cache misses overlap. All four datasets matched; peak memory unchanged (about 9.5 MB). 12 paired full runs on the 8 efficiency cores: wall 76 to 69 ms (faster in 8/12), CPU 468 to 426 ms (less in 12/12); on all cores: wall 68 to 65 ms (faster in 6/12), CPU 553 to 509 ms (less in 6/12). 8 and 32 records ahead measured about the same as 16. About 20 more code lines.
 
 Tried, not kept: the owned name bits (boxes, no barrier) on top of the prefetching build, the name lookups still prefetched 16 records ahead. Same output. 12 paired full runs each: on 6 performance threads wall 76 to 72 ms (faster in 8/12) but CPU 369 to 389 ms (less in 4/12); on the 8 efficiency cores wall 78 to 73 ms (6/12), CPU 455 to 495 ms (2/12); on all cores wall 69 to 93 ms (1/12), CPU 536 to 891 ms (0/12). Peak 9 MB against 10 to 13 MB. With the lookups prefetched, the atomic bits no longer stall much, and the hand-off costs more than it saves.
+
+`regions.csv` read on all threads, in two passes over its lines (the country codes in use, then each region's group byte, 0 meaning unknown), instead of on one thread through a 2 MB region table. Phase timers: 5 to 7 ms for the one-thread read and table, about 3 ms for the parallel one. Paired full runs on the 4 performance threads: wall 102 to 94 ms (faster in 10/12) and 99 to 95 ms (10/15), CPU 347 to 329 ms (less in 7/12); on all 12 threads, where the efficiency cores set the wall time, 62 to 62 ms (9/20). Peak unchanged (median 8 MiB on 4 threads). All four datasets matched. 308 to 316 code lines (scc after rustfmt).
+
+Also tried on the prefetching build, not kept (paired full runs; all matched on the four datasets):
+
+| Change | Result |
+|---|---|
+| Name table and bitsets mapped with MAP_POPULATE, so 12 threads do not fault their pages in at once (page faults were about 12% of samples) | all threads, 25 rounds: wall 63 to 63 ms (14/25), CPU 493 to 473 ms (16/25); 4 performance threads: 99 to 103 ms (5/15) |
+| `records.csv` mapped with MAP_POPULATE, or each thread populating its part with MADV_POPULATE_READ | faster in 5/15 each |
+| Records parsed in batches of 64 with each one's group byte, name slot and bit word prefetched, then looked up and set, in place of the 16-ahead ring (the group byte was the top cost, 21% of samples) | 4 performance threads: wall 102 to 100 ms (8/12), CPU 347 to 340 ms (9/12); 19 more lines |
+| The batches plus MAP_POPULATE plus the parallel `regions.csv` | 4 performance threads: wall 102 to 93 ms (9/12), CPU 347 to 312 ms (9/12); all threads: 61 to 62 ms (5/15); 37 more lines |
+| Prefix-xor as one carry-less multiply | faster in 7/15 |

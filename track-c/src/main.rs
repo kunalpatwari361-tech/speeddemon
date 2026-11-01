@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::thread;
 
 extern "C" {
@@ -11,13 +11,13 @@ extern "C" {
 
 const PR_SET_THP_DISABLE: i32 = 41;
 
-/// The whole file, read-only. /data is already in the page cache, so this costs no memory.
-/// n zeroed atomics (all-zero bytes are valid), whose pages the kernel supplies only when first touched.
-fn zeroed(n: usize) -> Vec<AtomicU64> {
-    let layout = std::alloc::Layout::array::<AtomicU64>(n.max(1)).unwrap();
-    unsafe { Vec::from_raw_parts(std::alloc::alloc_zeroed(layout) as *mut AtomicU64, n, n.max(1)) }
+/// n zeroed atomic integers (all-zero bytes are valid), whose pages the kernel supplies only when first touched.
+fn zeroed<T>(n: usize) -> Vec<T> {
+    let layout = std::alloc::Layout::array::<T>(n.max(1)).unwrap();
+    unsafe { Vec::from_raw_parts(std::alloc::alloc_zeroed(layout) as *mut T, n, n.max(1)) }
 }
 
+/// The whole file, read-only. /data is already in the page cache, so this costs no memory.
 fn map(path: &str) -> &'static [u8] {
     let f = File::open(path).unwrap();
     let len = f.metadata().unwrap().len() as usize;
@@ -25,17 +25,6 @@ fn map(path: &str) -> &'static [u8] {
         return &[];
     }
     unsafe { std::slice::from_raw_parts(mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0), len) }
-}
-
-/// Reads one unsigned integer at b[*i] and steps over the byte after it.
-fn num(b: &[u8], i: &mut usize) -> u64 {
-    let mut v = 0;
-    while b[*i].is_ascii_digit() {
-        v = v * 10 + (b[*i] - b'0') as u64;
-        *i += 1;
-    }
-    *i += 1;
-    v
 }
 
 /// Bitmasks of the quotes, and of the commas and LFs, among the 64 bytes of b from i (zeros past
@@ -127,30 +116,42 @@ struct Agg {
 fn main() {
     // No transparent huge pages: one would back a mostly untouched stretch of a lazily filled table.
     unsafe { prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) };
-    // A country code [A-Z]{3} is its own index into 26^3 slots, already in byte order.
+    let k = thread::available_parallelism().map_or(1, |x| x.get());
+    // regions.csv in k parts of whole lines "region_id,CCC". A country code [A-Z]{3} is its own
+    // index into 26^3 slots, already in byte order.
     let regions = map("/data/regions.csv");
-    let mut i = regions.iter().position(|&c| c == b'\n').unwrap() + 1;
-    let (mut region, mut used) = (Vec::new(), vec![false; 26 * 26 * 26]);
-    while i < regions.len() {
-        let id = num(regions, &mut i) as usize;
-        let code = regions[i..i + 3].iter().fold(0, |v, &c| v * 26 + (c - b'A') as usize);
-        region.resize(region.len().max(id + 1), u16::MAX);
-        region[id] = code as u16;
-        used[code] = true;
-        i += 4;
-    }
-    let codes: Vec<usize> = (0..used.len()).filter(|&c| used[c]).collect();
-    let unmatched = codes.len();
-    let mut rank = vec![unmatched as u8; used.len() + 1];
-    codes.iter().enumerate().for_each(|(r, &c)| rank[c] = r as u8);
-    let group: Vec<u8> = region.iter().map(|&c| rank[(c as usize).min(used.len())]).collect();
-    drop(region);
+    let body = regions.iter().position(|&c| c == b'\n').unwrap() + 1;
+    let line_at = |p: usize| p + regions[p - 1..].iter().position(|&c| c == b'\n').unwrap();
+    let rcut: Vec<usize> = (0..=k).map(|j| line_at(body + (regions.len() - body) * j / k)).collect();
+    let lines = |j: usize| regions[rcut[j]..rcut[j + 1]].split(|&c| c == b'\n').filter(|l| !l.is_empty());
+    let code = |l: &[u8]| l[l.len() - 3..].iter().fold(0, |v, &c| v * 26 + (c - b'A') as usize);
+    // First the codes in use, then each region's group, 1 + its code's rank, with 0 for
+    // _UNMATCHED. Region ids are unique, so the threads write separate bytes.
+    let used: Vec<AtomicU8> = zeroed(26 * 26 * 26);
+    thread::scope(|s| {
+        for j in 0..k {
+            let (lines, used) = (&lines, &used);
+            s.spawn(move || lines(j).for_each(|l| used[code(l)].store(1, Relaxed)));
+        }
+    });
+    let codes: Vec<usize> = (0..used.len()).filter(|&c| used[c].load(Relaxed) == 1).collect();
+    let mut rank = vec![0u8; used.len()];
+    codes.iter().enumerate().for_each(|(r, &c)| rank[c] = r as u8 + 1);
+    let groups = codes.len() + 1;
+    let last = regions[..regions.len() - 1].iter().rposition(|&c| c == b'\n').unwrap() + 1;
+    let group: Vec<AtomicU8> = zeroed(digits(regions, last, regions.len() - 5 - last) as usize + 1);
+    thread::scope(|s| {
+        for j in 0..k {
+            let (lines, group, rank) = (&lines, &group, &rank);
+            s.spawn(move || lines(j).for_each(|l| group[digits(l, 0, l.len() - 4) as usize].store(rank[code(l)], Relaxed)));
+        }
+    });
 
     // Every distinct name gets a slot in one shared open-addressing table, and each group
     // marks the slots of its names in its own bitset.
     let b = map("/data/records.csv");
     let slots: Vec<AtomicU64> = zeroed(1 << SLOT_BITS);
-    let seen: Vec<AtomicU64> = zeroed((unmatched + 1) << (SLOT_BITS - 6));
+    let seen: Vec<AtomicU64> = zeroed(groups << (SLOT_BITS - 6));
     // A slot holds a name's 64-bit hash, which identifies it among the 100,000 (a collision is
     // about 1 in 4 billion).
     let hash_of = |at: usize, len: usize| {
@@ -173,7 +174,6 @@ fn main() {
         }
     };
 
-    let k = thread::available_parallelism().map_or(1, |x| x.get());
     let body = b.iter().position(|&c| c == b'\n').map_or(b.len(), |p| p + 1);
     let mut cut: Vec<usize> = (0..k).map(|j| record_start(b, body + (b.len() - body) * j / k).max(body)).collect();
     cut[0] = body;
@@ -185,7 +185,7 @@ fn main() {
             .map(|w| {
                 let (group, seen, slots, hash_of, home, slot_of) = (&group, &seen, &slots, &hash_of, &home, &slot_of);
                 s.spawn(move || {
-                    let mut agg = vec![empty; unmatched + 1];
+                    let mut agg = vec![empty; groups];
                     // A record's name is hashed when it is parsed, and its home slot and that slot's
                     // bit for the group are prefetched; the lookup and the bit wait AHEAD records.
                     let fetch = |p: *const AtomicU64| unsafe { std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
@@ -219,7 +219,7 @@ fn main() {
                                 0 => id = digits(b, start, len),
                                 1 => name = text(b, start, len, before - field_quotes),
                                 2 => note_len = text(b, start, len, before - field_quotes).2,
-                                3 => g = *group.get(digits(b, start, len) as usize).unwrap_or(&(unmatched as u8)) as usize,
+                                3 => g = group.get(digits(b, start, len) as usize).map_or(0, |v| v.load(Relaxed)) as usize,
                                 _ => {
                                     // The amount, [-]digits.dd, then the CR of a CRLF.
                                     let neg = b[start] == b'-';
@@ -264,7 +264,7 @@ fn main() {
     });
 
     let mut out = Vec::new();
-    for g in 0..=unmatched {
+    for g in (1..=codes.len()).chain([0]) {
         let mut a = empty;
         for p in &parts {
             let x = p[g];
@@ -277,7 +277,7 @@ fn main() {
         }
         let words = &seen[g << (SLOT_BITS - 6)..(g + 1) << (SLOT_BITS - 6)];
         let names: u32 = words.iter().map(|w| w.load(Relaxed).count_ones()).sum();
-        let c = codes.get(g).map(|&c| [c / 676, c / 26 % 26, c % 26].map(|x| (b'A' + x as u8) as char));
+        let c = codes.get(g.wrapping_sub(1)).map(|&c| [c / 676, c / 26 % 26, c % 26].map(|x| (b'A' + x as u8) as char));
         let key: String = c.map_or("_UNMATCHED".into(), String::from_iter);
         let (sum, min, max) = (money(a.sum), money(a.min), money(a.max));
         writeln!(out, "{key} {} {} {sum} {min} {max} {names} {} {}", a.count, a.ids, a.name_bytes, a.note_bytes).unwrap();
