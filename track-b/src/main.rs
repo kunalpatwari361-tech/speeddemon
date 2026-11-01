@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::thread;
 
 extern "C" {
@@ -225,11 +225,12 @@ impl Index<'_> {
     }
 }
 
-/// A posting set: a bitset over all documents when common, else ascending ids.
+/// A posting set: a bitset over all documents when common, else ascending ids. Both count from the
+/// round's first document, and a round holds fewer than 2^16 documents, so an id fits 16 bits.
 #[derive(Clone, Copy)]
 enum Set<'a> {
     Bits(&'a [u64]),
-    Ids(&'a [u32]),
+    Ids(&'a [u16]),
 }
 
 fn has(bits: &[u64], d: u32) -> bool {
@@ -247,7 +248,7 @@ fn eval<'a>(steps: &[(u8, u32)], set: impl Fn(u32) -> Set<'a>, r: &mut [u64], v:
             break;
         }
         match (op, set(id), dense) {
-            (b'=', Set::Ids(a), _) => (v.clear(), v.extend_from_slice(a), dense = false).0,
+            (b'=', Set::Ids(a), _) => (v.clear(), v.extend(a.iter().map(|&d| d as u32)), dense = false).0,
             (b'=', Set::Bits(b), _) => (r.copy_from_slice(b), dense = true).0,
             (_, Set::Bits(b), false) if op != b'O' => v.retain(|&d| has(b, d) == (op == b'A')),
             (_, Set::Ids(a), false) if op != b'O' => {
@@ -255,22 +256,22 @@ fn eval<'a>(steps: &[(u8, u32)], set: impl Fn(u32) -> Set<'a>, r: &mut [u64], v:
                 let mut i = 0;
                 v.retain(|&d| {
                     let mut step = 1;
-                    while i + step < a.len() && a[i + step] < d {
+                    while i + step < a.len() && (a[i + step] as u32) < d {
                         i += step;
                         step *= 2;
                     }
-                    i += a[i..(i + step + 1).min(a.len())].partition_point(|&x| x < d);
-                    (a.get(i) == Some(&d)) == (op == b'A')
+                    i += a[i..(i + step + 1).min(a.len())].partition_point(|&x| (x as u32) < d);
+                    (a.get(i).map(|&x| x as u32) == Some(d)) == (op == b'A')
                 });
             }
             // Two ascending runs: the stable sort finds them and merges them in one pass.
-            (_, Set::Ids(a), false) => (v.extend_from_slice(a), v.sort(), v.dedup()).0,
+            (_, Set::Ids(a), false) => (v.extend(a.iter().map(|&d| d as u32)), v.sort(), v.dedup()).0,
             (_, Set::Bits(b), false) => {
                 r.copy_from_slice(b);
                 v.iter().for_each(|&d| r[d as usize / 64] |= 1 << (d % 64));
                 dense = true;
             }
-            (b'A', Set::Ids(a), true) => (v.clear(), v.extend(a.iter().filter(|&&d| has(r, d))), dense = false).0,
+            (b'A', Set::Ids(a), true) => (v.clear(), v.extend(a.iter().map(|&d| d as u32).filter(|&d| has(r, d))), dense = false).0,
             (b'O', Set::Ids(a), true) => a.iter().for_each(|&d| r[d as usize / 64] |= 1 << (d % 64)),
             (_, Set::Ids(a), true) => a.iter().for_each(|&d| r[d as usize / 64] &= !(1 << (d % 64))),
             (_, Set::Bits(b), true) => r.iter_mut().zip(b).for_each(|(x, &y)| *x = match op {
@@ -415,7 +416,7 @@ fn main() {
             }
             start[id + 1] = start[id] + at;
         }
-        let flat: Vec<AtomicU32> = zeroed(start[ids] as usize);
+        let flat: Vec<AtomicU16> = zeroed(start[ids] as usize);
         thread::scope(|s| {
             for (stream, mut cur) in streams.into_iter().zip(counts) {
                 let (flat, start) = (&flat, &start);
@@ -426,7 +427,7 @@ fn main() {
                             doc = v & !(1 << 31);
                         } else {
                             let v = v as usize;
-                            flat[(start[v] + cur[v] as u32) as usize].store(doc, Relaxed);
+                            flat[(start[v] + cur[v] as u32) as usize].store(doc as u16, Relaxed);
                             cur[v] += 1;
                         }
                     }
@@ -434,7 +435,7 @@ fn main() {
             }
         });
         let bits: Vec<u64> = bits.into_iter().map(AtomicU64::into_inner).collect();
-        let flat: Vec<u32> = flat.into_iter().map(AtomicU32::into_inner).collect();
+        let flat: Vec<u16> = flat.into_iter().map(AtomicU16::into_inner).collect();
         let set = |id: u32| {
             let id = if id >> 31 == 1 { (nt + (id & !(1 << 31))) as usize } else { id as usize };
             match bit_of[id] {
