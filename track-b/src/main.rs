@@ -4,6 +4,8 @@ use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::thread;
 
+mod opt;
+
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
@@ -532,20 +534,17 @@ fn main() {
             for (block, acc) in queries.chunks(chunk).zip(acc.chunks_mut(chunk)) {
                 let (set, end, steps) = (&set, &end, &steps);
                 s.spawn(move || {
-                    let (mut r, mut v, mut phrase, mut toks) = (vec![0u64; words], Vec::new(), Vec::new(), Vec::new());
+                    let (mut r, mut v) = (vec![0u64; words], Vec::new());
                     for (&[from, to, at, stop], (count, sum, ten)) in block.iter().zip(acc) {
                         eval(&steps[from as usize..to as usize], set, &mut r, &mut v);
                         if to - from > 1 && stop > at {
-                            // Every adjacent pair occurs; check the words occur together, in order.
-                            phrase.clear();
-                            phrase.extend(q[at as usize..stop as usize].split(|&c| c == b' '));
+                            // Pair postings narrow candidates; verify full phrase without allocating token vectors.
+                            let phrase = &q[at as usize..stop as usize];
                             v.retain(|&d| {
                                 let d = d0 + d as usize;
                                 let line = if d == 0 { 0 } else { end[d - 1].load(Relaxed) as usize + 1 };
                                 let tab = line + docs[line..].iter().position(|&c| c == b'\t').unwrap();
-                                toks.clear();
-                                toks.extend(tokens(&docs[tab + 1..end[d].load(Relaxed) as usize]));
-                                toks.windows(phrase.len()).any(|w| w.iter().zip(&phrase).all(|(a, b)| a.eq_ignore_ascii_case(b)))
+                                opt::phrase_matches(&docs[tab + 1..end[d].load(Relaxed) as usize], phrase)
                             });
                         }
                         let have = (*count).min(10) as usize;
