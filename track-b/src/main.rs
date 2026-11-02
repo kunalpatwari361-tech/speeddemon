@@ -323,16 +323,24 @@ fn step(op: u8, id: u32) -> u32 {
 /// 'O' or, 'N' and-not, with set(id) an id's documents. The result is held as the bitset r instead
 /// only while loading or ORing in a common term has made it large; an AND with ids makes it a list
 /// again. An empty list with no OR still to come is the answer, and the other steps are not read.
-fn eval<'a>(steps: &[u32], set: impl Fn(u32) -> Set<'a>, r: &mut [u64], v: &mut Vec<u32>) {
-    let mut dense = false;
+/// Returns None when the result is the list v; else Some of the bitset it is in: a term's own bitset,
+/// read in place, or Some(None) for r.
+fn eval<'a>(steps: &[u32], set: impl Fn(u32) -> Set<'a>, r: &mut [u64], v: &mut Vec<u32>, merged: &mut Vec<u32>) -> Option<Option<&'a [u64]>> {
+    // While the result is still a term's bitset, it is read there; it is copied into r only to change.
+    let (mut dense, mut held): (bool, Option<&'a [u64]>) = (false, None);
+    let mut own = |r: &mut [u64], held: &mut Option<&'a [u64]>| {
+        if let Some(b) = held.take() {
+            r.copy_from_slice(b);
+        }
+    };
     for (i, &s) in steps.iter().enumerate() {
         let (op, id) = (OPS[(s >> 29 & 3) as usize], s & !(3 << 29));
         if i > 0 && !dense && v.is_empty() && steps[i..].iter().all(|&s| OPS[(s >> 29 & 3) as usize] != b'O') {
             break;
         }
         match (op, set(id), dense) {
-            (b'=', Set::Ids(a), _) => (v.clear(), v.extend(a.iter().map(|&d| d as u32)), dense = false).0,
-            (b'=', Set::Bits(b), _) => (r.copy_from_slice(b), dense = true).0,
+            (b'=', Set::Ids(a), _) => (v.clear(), v.extend(a.iter().map(|&d| d as u32)), dense = false, held = None).0,
+            (b'=', Set::Bits(b), _) => (held = Some(b), dense = true).0,
             (_, Set::Bits(b), false) if op != b'O' => v.retain(|&d| has(b, d) == (op == b'A')),
             (_, Set::Ids(a), false) if op != b'O' => {
                 // Gallop: steps of 1, 2, 4, ... past the ids below d, then a binary search in the last step.
@@ -347,33 +355,65 @@ fn eval<'a>(steps: &[u32], set: impl Fn(u32) -> Set<'a>, r: &mut [u64], v: &mut 
                     (a.get(i).map(|&x| x as u32) == Some(d)) == (op == b'A')
                 });
             }
-            // Two ascending runs: the stable sort finds them and merges them in one pass.
-            (_, Set::Ids(a), false) => (v.extend(a.iter().map(|&d| d as u32)), v.sort(), v.dedup()).0,
+            // Two ascending lists merged into a reused buffer.
+            (_, Set::Ids(a), false) => {
+                merged.clear();
+                let (mut i, mut j) = (0, 0);
+                while i < v.len() && j < a.len() {
+                    let (x, y) = (v[i], a[j] as u32);
+                    merged.push(x.min(y));
+                    (i, j) = (i + (x <= y) as usize, j + (y <= x) as usize);
+                }
+                merged.extend_from_slice(&v[i..]);
+                merged.extend(a[j..].iter().map(|&d| d as u32));
+                std::mem::swap(v, merged);
+            }
             (_, Set::Bits(b), false) => {
-                r.copy_from_slice(b);
+                (r.copy_from_slice(b), held = None);
                 v.iter().for_each(|&d| r[d as usize / 64] |= 1 << (d % 64));
                 dense = true;
             }
-            (b'A', Set::Ids(a), true) => (v.clear(), v.extend(a.iter().map(|&d| d as u32).filter(|&d| has(r, d))), dense = false).0,
-            (b'O', Set::Ids(a), true) => a.iter().for_each(|&d| r[d as usize / 64] |= 1 << (d % 64)),
-            (_, Set::Ids(a), true) => a.iter().for_each(|&d| r[d as usize / 64] &= !(1 << (d % 64))),
-            (_, Set::Bits(b), true) => r.iter_mut().zip(b).for_each(|(x, &y)| *x = match op {
-                b'A' => *x & y,
-                b'O' => *x | y,
-                _ => *x & !y,
-            }),
-        }
-    }
-    if dense {
-        v.clear();
-        for (wi, &w) in r.iter().enumerate() {
-            let mut x = w;
-            while x != 0 {
-                v.push((wi * 64) as u32 + x.trailing_zeros());
-                x &= x - 1;
+            (b'A', Set::Ids(a), true) => {
+                let cur: &[u64] = held.unwrap_or(r);
+                v.clear();
+                v.extend(a.iter().map(|&d| d as u32).filter(|&d| has(cur, d)));
+                (dense, held) = (false, None);
+            }
+            (b'O', Set::Ids(a), true) => (own(r, &mut held), a.iter().for_each(|&d| r[d as usize / 64] |= 1 << (d % 64))).0,
+            (_, Set::Ids(a), true) => (own(r, &mut held), a.iter().for_each(|&d| r[d as usize / 64] &= !(1 << (d % 64)))).0,
+            (_, Set::Bits(b), true) => {
+                // Written in one pass from the held bitset or r and b.
+                let from = held.take();
+                for (i, x) in r.iter_mut().enumerate() {
+                    let (x0, y) = (from.map_or(*x, |f| f[i]), b[i]);
+                    *x = match op {
+                        b'A' => x0 & y,
+                        b'O' => x0 | y,
+                        _ => x0 & !y,
+                    };
+                }
             }
         }
     }
+    dense.then_some(held)
+}
+
+/// The ids in the bitset r, ascending, into v.
+fn list(r: &[u64], v: &mut Vec<u32>) {
+    v.clear();
+    for (wi, &w) in r.iter().enumerate() {
+        let mut x = w;
+        while x != 0 {
+            v.push((wi * 64) as u32 + x.trailing_zeros());
+            x &= x - 1;
+        }
+    }
+}
+
+/// The sum of the positions of x's set bits: bit b of a position is set in the words of mask b.
+fn positions(x: u64) -> u64 {
+    const MASKS: [u64; 6] = [0xaaaa_aaaa_aaaa_aaaa, 0xcccc_cccc_cccc_cccc, 0xf0f0_f0f0_f0f0_f0f0, 0xff00_ff00_ff00_ff00, 0xffff_0000_ffff_0000, 0xffff_ffff_0000_0000];
+    MASKS.iter().enumerate().map(|(b, &m)| ((x & m).count_ones() as u64) << b).sum()
 }
 
 /// The documents are indexed and queried in this many rounds, so only one round's postings are held.
@@ -532,10 +572,28 @@ fn main() {
             for (block, acc) in queries.chunks(chunk).zip(acc.chunks_mut(chunk)) {
                 let (set, end, steps) = (&set, &end, &steps);
                 s.spawn(move || {
-                    let (mut r, mut v, mut phrase, mut toks) = (vec![0u64; words], Vec::new(), Vec::new(), Vec::new());
+                    let (mut r, mut v, mut merged, mut phrase, mut toks) = (vec![0u64; words], Vec::new(), Vec::new(), Vec::new(), Vec::new());
                     for (&[from, to, at, stop], (count, sum, ten)) in block.iter().zip(acc) {
-                        eval(&steps[from as usize..to as usize], set, &mut r, &mut v);
-                        if to - from > 1 && stop > at {
+                        let res = eval(&steps[from as usize..to as usize], set, &mut r, &mut v, &mut merged);
+                        let long = to - from > 1 && stop > at;
+                        let dense = res.map(|b| b.unwrap_or(&r));
+                        if let (Some(bits), false) = (dense, long) {
+                            // Count, id sum and first ids straight from the bitset.
+                            for (wi, &w) in bits.iter().enumerate().filter(|&(_, &w)| w != 0) {
+                                let mut x = w;
+                                while *count < 10 && x != 0 {
+                                    ten[*count as usize] = (d0 + wi * 64) as u32 + x.trailing_zeros();
+                                    (*count, x) = (*count + 1, x & (x - 1));
+                                }
+                                *count += x.count_ones() as u64;
+                                *sum += (d0 + wi * 64) as u64 * w.count_ones() as u64 + positions(w);
+                            }
+                            continue;
+                        }
+                        if let Some(bits) = dense {
+                            list(bits, &mut v);
+                        }
+                        if long {
                             // Every adjacent pair occurs; check the words occur together, in order.
                             phrase.clear();
                             phrase.extend(q[at as usize..stop as usize].split(|&c| c == b' '));
