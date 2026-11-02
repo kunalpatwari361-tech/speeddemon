@@ -8,6 +8,7 @@ use rustc_hash::FxHashSet;
 
 extern "C" {
     fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
+    fn speed_demon_num(bytes: *const u8, len: usize) -> u32;
 }
 
 const PR_SET_THP_DISABLE: i32 = 41;
@@ -199,7 +200,7 @@ fn cuts(b: &[u8], k: usize) -> Vec<usize> {
 
 /// The decimal number the bytes start with.
 fn num(b: &[u8]) -> usize {
-    b.iter().take_while(|c| c.is_ascii_digit()).fold(0, |v, &c| v * 10 + (c - b'0') as usize)
+    unsafe { speed_demon_num(b.as_ptr(), b.len()) as usize }
 }
 
 /// Runs f(j) for every j in 0..k, each on its own thread, and returns the results in order.
