@@ -91,3 +91,8 @@ Prefetching the group entry: a record's group-table entry is prefetched when it 
 
 
 Hashing experiment (not yet benchmarked): replace the per-chunk `u128` shift used to mask the final 1–7 bytes of a name with a 64-bit mask and an explicit chunk loop. The hash recurrence and byte order are unchanged. This targets the name-hashing hot path; compile validation, all-four-dataset output hashes, and paired runtime measurements are still required before judging whether it helps.
+
+
+## Hash-load experiment (not yet benchmarked)
+
+The name hash now reads complete 8-byte chunks with one inlined unaligned load and processes pairs of chunks per loop iteration. The final 1–7 bytes still use the original zero-padded load path and mask, and the hash recurrence, byte order, and final odd-bit tag are unchanged. This removes the generic slice-boundary branch from complete chunks and halves loop iterations for longer names. It is a candidate optimization only: Rust compilation, all-four-dataset output hashes, and paired full-data runtime/peak-memory measurements have not been run in this environment. Keep or revert based on those results; no speedup is claimed.
