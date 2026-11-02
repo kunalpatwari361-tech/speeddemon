@@ -75,6 +75,14 @@ fn digits(b: &[u8], at: usize, n: usize) -> u64 {
     (x * 10000 + (x >> 32)) & 0xffff_ffff
 }
 
+
+/// Fast little-endian load for a complete 8-byte chunk. Callers must prove
+/// that all eight bytes are within the input slice.
+#[inline(always)]
+fn load_full(b: &[u8], i: usize) -> u64 {
+    unsafe { u64::from_le(std::ptr::read_unaligned(b.as_ptr().add(i).cast::<u64>())) }
+}
+
 /// A text field of len bytes at b[at], holding q quote bytes, as (start, raw length, value length).
 /// A quoted value loses its two quotes and one byte per "" pair; the raw bytes identify the value,
 /// since escaping is one to one.
@@ -156,14 +164,33 @@ fn main() {
     // about 1 in 4 billion).
     let hash_of = |at: usize, len: usize| {
         let mut h = len as u64;
+        let full = len / 8;
         let mut k = 0;
-        while k < len {
-            let n = (len - k).min(8);
-            let mask = if n == 8 { u64::MAX } else { (1u64 << (n * 8)) - 1 };
-            h = (h ^ (load(b, at + k) & mask))
+
+        // Unroll pairs of full chunks. These reads are safe because each full
+        // chunk is wholly inside the name's byte range.
+        while k + 1 < full {
+            h = (h ^ load_full(b, at + k * 8))
                 .wrapping_mul(0x9e37_79b9_7f4a_7c15)
                 .rotate_left(29);
-            k += 8;
+            h = (h ^ load_full(b, at + (k + 1) * 8))
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                .rotate_left(29);
+            k += 2;
+        }
+        if k < full {
+            h = (h ^ load_full(b, at + k * 8))
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                .rotate_left(29);
+        }
+
+        // Keep the original zero-padded tail semantics for the final 1..7 bytes.
+        let tail = len & 7;
+        if tail != 0 {
+            let mask = (1u64 << (tail * 8)) - 1;
+            h = (h ^ (load(b, at + full * 8) & mask))
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                .rotate_left(29);
         }
         h | 1
     };
