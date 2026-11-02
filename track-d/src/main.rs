@@ -63,6 +63,19 @@ fn edges(g: &[u8], parts: &[usize], f: impl Fn(usize, usize, u64) + Sync) {
     });
 }
 
+#[derive(Clone, Copy)]
+struct WriteOnly(*mut u64);
+// SAFETY: Writes through this wrapper are only made by the unsafe call site below, which reserves
+// a distinct in-bounds slot for every edge with an atomic per-node cursor.
+unsafe impl Send for WriteOnly {}
+// SAFETY: The same reservation invariant prevents overlapping writes through shared references.
+unsafe impl Sync for WriteOnly {}
+impl WriteOnly {
+    /// # Safety
+    /// `i` must be in the allocation, and no other access may read or write that slot concurrently.
+    unsafe fn write(self, i: usize, v: u64) { self.0.add(i).write(v); }
+}
+
 /// Node ids fit in the low bits of a heap entry; distances, below 2^43 for this generator, above them.
 const NODE_BITS: u32 = 21;
 
@@ -120,19 +133,60 @@ fn bucket(d: u64, last: u64) -> usize {
     (64 - (d ^ last).leading_zeros()) as usize
 }
 
-/// Dijkstra from s, stopping when t is settled, over a zeroed table of D holding distance + 1
-/// (0 is unreached). If the target cannot be reached within D, returns None for a wider retry.
+/// Distance storage used by Dijkstra. The wide retry uses six bytes per node: enough for the
+/// generator's documented <2^43 path bound, while avoiding a full u64 table.
+trait DistTable {
+    fn len(&self) -> usize;
+    fn get(&self, i: usize) -> u64;
+    fn put(&mut self, i: usize, v: u64) -> bool;
+    fn clear(&mut self);
+}
+
+impl DistTable for Vec<u16> {
+    fn len(&self) -> usize { Vec::len(self) }
+    fn get(&self, i: usize) -> u64 { self[i] as u64 }
+    fn put(&mut self, i: usize, v: u64) -> bool {
+        let Ok(v) = u16::try_from(v) else { return false };
+        self[i] = v;
+        true
+    }
+    fn clear(&mut self) { self.fill(0); }
+}
+
+struct PackedWide { bytes: Vec<u8> }
+
+impl PackedWide {
+    fn new(n: usize) -> Self { Self { bytes: vec![0; n * 6] } }
+}
+
+impl DistTable for PackedWide {
+    fn len(&self) -> usize { self.bytes.len() / 6 }
+    fn get(&self, i: usize) -> u64 {
+        let p = i * 6;
+        (0..6).fold(0, |v, j| v | (self.bytes[p + j] as u64) << (j * 8))
+    }
+    fn put(&mut self, i: usize, v: u64) -> bool {
+        if v >= (1 << 48) { return false }
+        let p = i * 6;
+        for j in 0..6 { self.bytes[p + j] = (v >> (j * 8)) as u8; }
+        true
+    }
+    fn clear(&mut self) { self.bytes.fill(0); }
+}
+
+/// Dijkstra from s, stopping when t is settled, over a zeroed table holding distance + 1
+/// (0 is unreached). If the target cannot be reached within the table's width, returns None.
 /// Leaves the table zeroed again: the nodes reached are listed in seen, up to a sixteenth of the
 /// table, and past that the whole table is cleared instead.
-fn search<D: Copy + Default + Into<u64> + TryFrom<u64>>(off: &[u32], adj: &[u64], dist: &mut [D], seen: &mut Vec<u32>, heap: &mut RadixHeap, s: usize, t: usize) -> Option<i64> {
+fn search<T: DistTable>(off: &[u32], adj: &[u64], dist: &mut T, seen: &mut Vec<u32>, heap: &mut RadixHeap, s: usize, t: usize) -> Option<i64> {
     heap.clear();
     heap.push(0, s as u32);
-    dist[s] = D::try_from(1).ok()?;
+    dist.put(s, 1);
     seen.push(s as u32);
     let (mut found, mut too_wide, mut all) = (Some(-1), false, false);
     while let Some((d, u)) = heap.pop() {
         let u = u as usize;
-        if d + 1 > dist[u].into() {
+        if d + 1 > dist.get(u) {
             continue;
         }
         if u == t {
@@ -141,25 +195,24 @@ fn search<D: Copy + Default + Into<u64> + TryFrom<u64>>(off: &[u32], adj: &[u64]
         }
         for &e in &adj[off[u] as usize..off[u + 1] as usize] {
             let (v, nd) = ((e >> 32) as usize, d + (e & 0xffff_ffff));
-            let Ok(x) = D::try_from(nd + 1) else {
-                too_wide = true;
-                continue;
-            };
-            let old: u64 = dist[v].into();
+            let old = dist.get(v);
             if old == 0 || nd + 1 < old {
+                if !dist.put(v, nd + 1) {
+                    too_wide = true;
+                    continue;
+                }
                 if old == 0 && !all {
                     all = seen.len() == dist.len() / 16;
                     seen.push(v as u32);
                 }
-                dist[v] = x;
                 heap.push(nd, v as u32);
             }
         }
     }
     if all {
-        (dist.fill(D::default()), seen.clear()).0
+        (dist.clear(), seen.clear()).0
     } else {
-        seen.drain(..).for_each(|v| dist[v as usize] = D::default());
+        seen.drain(..).for_each(|v| { dist.put(v as usize, 0); });
     }
     if too_wide && found == Some(-1) { None } else { found }
 }
@@ -175,33 +228,23 @@ fn main() {
     let (n, m) = (num(g, &mut i) as usize, num(g, &mut i) as usize);
     let k = thread::available_parallelism().map_or(1, |x| x.get());
     let parts = cuts(g, i, k);
-    // The queries first: only their targets' in-edges are looked for.
-    let q = map("/data/queries.txt");
-    let (mut i, mut raw) = (0, Vec::new());
-    while i < q.len() {
-        raw.push((num(q, &mut i) as usize, num(q, &mut i) as usize));
-    }
-    let mut target = vec![0u64; n / 64 + 1];
-    raw.iter().for_each(|&(_, t)| target[t / 64] |= 1 << (t % 64));
-    // The graph is read twice, which costs no memory as /data is in the page cache. The first read
-    // counts out-degrees and marks the targets that have in-edges.
+    // The graph is read three times, which costs no memory as /data is in the page cache, so only one
+    // edge array is ever held. The first read counts out-degrees and marks nodes with in-edges.
     let (deg, has_in): (Vec<AtomicU32>, Vec<AtomicU64>) = (zeroed(n + 1), zeroed(n / 64 + 1));
     edges(g, &parts, |u, v, _| {
         deg[u + 1].fetch_add(1, Relaxed);
-        if target[v / 64] >> (v % 64) & 1 == 1 {
-            has_in[v / 64].fetch_or(1 << (v % 64), Relaxed);
-        }
+        has_in[v / 64].fetch_or(1 << (v % 64), Relaxed);
     });
     let mut off: Vec<u32> = deg.into_iter().map(AtomicU32::into_inner).collect();
     for j in 1..=n {
         off[j] += off[j - 1];
     }
-    // The second places each edge as its head and weight in one 64-bit word, with an atomic cursor per node.
+    // The second places each edge's head, with an atomic cursor per node: enough to renumber.
     let next: Vec<AtomicU32> = off[..n].iter().map(|&o| AtomicU32::new(o)).collect();
-    let old: Vec<AtomicU64> = zeroed(m);
-    edges(g, &parts, |u, v, w| old[next[u].fetch_add(1, Relaxed) as usize].store((v as u64) << 32 | w, Relaxed));
+    let heads: Vec<AtomicU32> = zeroed(m);
+    edges(g, &parts, |u, v, _| heads[next[u].fetch_add(1, Relaxed) as usize].store(v as u32, Relaxed));
     drop(next);
-    let old: Vec<u64> = old.into_iter().map(AtomicU64::into_inner).collect();
+    let heads: Vec<u32> = heads.into_iter().map(AtomicU32::into_inner).collect();
 
     // Ids are a random relabelling. Renumber so a search touches nearby memory: k breadth-first
     // searches grow regions in parallel, each claiming unclaimed nodes, and each region gets a
@@ -210,7 +253,7 @@ fn main() {
     let mut regions: Vec<Vec<u32>> = thread::scope(|s| {
         let hs: Vec<_> = (0..k)
             .map(|r| {
-                let (off, old, owner) = (&off, &old, &owner);
+                let (off, heads, owner) = (&off, &heads, &owner);
                 s.spawn(move || {
                     let claim = |v: usize| owner[v].load(Relaxed) == 0 && owner[v].compare_exchange(0, r as u32 + 1, Relaxed, Relaxed).is_ok();
                     let root = r * n / k;
@@ -218,9 +261,9 @@ fn main() {
                     let mut head = 0;
                     while let Some(&u) = order.get(head) {
                         head += 1;
-                        for &e in &old[off[u as usize] as usize..off[u as usize + 1] as usize] {
-                            if claim((e >> 32) as usize) {
-                                order.push((e >> 32) as u32);
+                        for &v in &heads[off[u as usize] as usize..off[u as usize + 1] as usize] {
+                            if claim(v as usize) {
+                                order.push(v);
                             }
                         }
                     }
@@ -231,7 +274,7 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     regions.push((0..n as u32).filter(|&v| owner[v as usize].load(Relaxed) == 0).collect());
-    drop(owner);
+    drop((owner, heads));
 
     // Each region, in parallel, numbers its nodes from its base and records their out-degrees in
     // the new order.
@@ -248,54 +291,55 @@ fn main() {
             });
         }
     });
+    drop((off, regions));
     let new: Vec<u32> = new.into_iter().map(AtomicU32::into_inner).collect();
-    let mut off2: Vec<u32> = deg.into_iter().map(AtomicU32::into_inner).collect();
+    let mut off: Vec<u32> = deg.into_iter().map(AtomicU32::into_inner).collect();
     for j in 1..=n {
-        off2[j] += off2[j - 1];
+        off[j] += off[j - 1];
     }
-    // Then every region copies its nodes' edges, renamed, into its own stretch of the new array.
+    // The third read places every edge, renamed, as its head and weight in one 64-bit word.
+    let next: Vec<AtomicU32> = off[..n].iter().map(|&o| AtomicU32::new(o)).collect();
     let mut adj = vec![0u64; m];
-    thread::scope(|s| {
-        let mut rest = &mut adj[..];
-        for (r, &b) in regions.iter().zip(&base) {
-            let (mine, tail) = std::mem::take(&mut rest).split_at_mut((off2[b + r.len()] - off2[b]) as usize);
-            rest = tail;
-            let (off, old, new) = (&off, &old, &new);
-            s.spawn(move || {
-                let mut out = mine.iter_mut();
-                for &u in r {
-                    for &e in &old[off[u as usize] as usize..off[u as usize + 1] as usize] {
-                        *out.next().unwrap() = (new[(e >> 32) as usize] as u64) << 32 | e & 0xffff_ffff;
-                    }
-                }
-            });
-        }
+    let ptr = WriteOnly(adj.as_mut_ptr());
+    // SAFETY: `next[new[u]]` starts at that renamed node's prefix offset. The first graph pass
+    // counted exactly its outgoing edges, so atomic fetch_add assigns each edge one distinct index
+    // in `[off[new[u]], off[new[u] + 1])`, within `adj`. No reads happen until all writers join.
+    edges(g, &parts, |u, v, w| unsafe {
+        ptr.write(next[new[u] as usize].fetch_add(1, Relaxed) as usize, (new[v] as u64) << 32 | w);
     });
-    drop((off, old, regions));
-    let off = off2;
-    // A target with no in-edges is answered -1 without searching, which avoids settling the whole
-    // graph; it is marked by a renamed target of u32::MAX.
-    let reach = |s: usize, t: usize| s == t || has_in[t / 64].load(Relaxed) >> (t % 64) & 1 == 1;
-    let queries: Vec<(u32, u32)> = raw.iter().map(|&(s, t)| (new[s], if reach(s, t) { new[t] } else { u32::MAX })).collect();
-    drop((new, has_in, target));
+    drop(next);
 
     // Queries sorted by renumbered source, one block per thread, so a thread's searches stay in one
     // part of the graph and touch only that part of its lazily zeroed distance table. A thread that
     // finishes its block helps with the others.
+    let q = map("/data/queries.txt");
+    let mut i = 0;
+    let mut queries = Vec::new();
+    while i < q.len() {
+        let (s, t) = (num(q, &mut i) as usize, num(q, &mut i) as usize);
+        // A target with no in-edges is answered -1 without searching, which avoids settling the
+        // whole graph; it is marked by a renamed target of u32::MAX.
+        let reach = s == t || has_in[t / 64].load(Relaxed) >> (t % 64) & 1 == 1;
+        queries.push((new[s], if reach { new[t] } else { u32::MAX }));
+    }
+    drop((new, has_in));
+    // Keep graph construction at the machine's full width, but use a smaller search pool so
+    // each worker's lazy distance table does not multiply the peak RSS.
+    let search_k = k.min(7);
     let mut order: Vec<usize> = (0..queries.len()).collect();
     order.sort_unstable_by_key(|&j| queries[j].0);
-    let blocks: Vec<&[usize]> = (0..k).map(|b| &order[order.len() * b / k..order.len() * (b + 1) / k]).collect();
-    let taken: Vec<AtomicUsize> = (0..k).map(|_| AtomicUsize::new(0)).collect();
+    let blocks: Vec<&[usize]> = (0..search_k).map(|b| &order[order.len() * b / search_k..order.len() * (b + 1) / search_k]).collect();
+    let taken: Vec<AtomicUsize> = (0..search_k).map(|_| AtomicUsize::new(0)).collect();
     let answers: Vec<AtomicU64> = queries.iter().map(|_| AtomicU64::new(0)).collect();
-    let wide = std::sync::Mutex::new(Vec::new());
+    let wide = std::sync::Mutex::new(None::<PackedWide>);
     thread::scope(|s| {
-        for me in 0..k {
+        for me in 0..search_k {
             let (blocks, taken, queries, answers, wide, off, adj) = (&blocks, &taken, &queries, &answers, &wide, &off, &adj);
             s.spawn(move || {
                 // Most answers fit in 16 bits. Search within that exact bound first; queries
                 // whose target is not settled there are retried against the shared 64-bit table.
                 let (mut dist, mut seen, mut heap) = (vec![0u16; n], Vec::new(), RadixHeap::new());
-                for b in (0..k).map(|x| (me + x) % k) {
+                for b in (0..search_k).map(|x| (me + x) % search_k) {
                     while let Some(&j) = blocks[b].get(taken[b].fetch_add(1, Relaxed)) {
                         let (s, t2) = (queries[j].0 as usize, queries[j].1 as usize);
                         let d = if s == t2 {
@@ -306,10 +350,7 @@ fn main() {
                             d
                         } else {
                             let mut wide = wide.lock().unwrap();
-                            if wide.is_empty() {
-                                *wide = vec![0u64; n];
-                            }
-                            search(off, adj, &mut wide, &mut seen, &mut heap, s, t2).unwrap()
+                            search(off, adj, wide.get_or_insert_with(|| PackedWide::new(n)), &mut seen, &mut heap, s, t2).unwrap()
                         };
                         answers[j].store(d as u64, Relaxed);
                     }
