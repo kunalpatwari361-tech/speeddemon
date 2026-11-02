@@ -513,10 +513,10 @@ fn main() {
             start[id + 1] = start[id] + at;
         }
         let flat: Vec<AtomicU16> = zeroed(start[ids] as usize);
-        thread::scope(|s| {
+        rayon::scope(|s| {
             for (stream, mut cur) in streams.into_iter().zip(counts) {
                 let (flat, start) = (&flat, &start);
-                s.spawn(move || {
+                s.spawn(move |_| {
                     let mut doc = 0;
                     for v in stream {
                         if v >> 31 == 1 {
@@ -541,10 +541,10 @@ fn main() {
         };
 
         // Answer the queries on the round's documents in k contiguous blocks of queries.
-        thread::scope(|s| {
+        rayon::scope(|s| {
             for (block, acc) in queries.chunks(chunk).zip(acc.chunks_mut(chunk)) {
                 let (set, end, steps) = (&set, &end, &steps);
-                s.spawn(move || {
+                s.spawn(move |_| {
                     let (mut r, mut v, mut phrase, mut toks) = (vec![0u64; words], Vec::new(), Vec::new(), Vec::new());
                     for (&[from, to, at, stop], (count, sum, ten)) in block.iter().zip(acc) {
                         let dense = eval(&steps[from as usize..to as usize], set, &mut r, &mut v);
@@ -589,22 +589,17 @@ fn main() {
     }
 
     // Write the answers in k contiguous blocks, each into its own buffer.
-    let outs: Vec<Vec<u8>> = thread::scope(|s| {
-        let hs: Vec<_> = acc
-            .chunks(chunk)
-            .map(|block| {
-                s.spawn(move || {
-                    let mut out = Vec::new();
-                    for (count, sum, ten) in block {
-                        write!(out, "{count} {sum}").unwrap();
-                        ten[..(*count).min(10) as usize].iter().for_each(|d| write!(out, " {d}").unwrap());
-                        writeln!(out).unwrap();
-                    }
-                    out
-                })
-            })
-            .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+    let outs: Vec<Vec<u8>> = acc
+        .par_chunks(chunk)
+        .map(|block| {
+            let mut out = Vec::new();
+            for (count, sum, ten) in block {
+                write!(out, "{count} {sum}").unwrap();
+                ten[..(*count).min(10) as usize].iter().for_each(|d| write!(out, " {d}").unwrap());
+                writeln!(out).unwrap();
+            }
+            out
+        })
+        .collect();
     std::fs::write("/out/results.txt", outs.concat()).unwrap();
 }
