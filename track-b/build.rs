@@ -19,5 +19,7 @@ fn main() {
     assert!(status.success(), "C helper archive failed");
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=fast_num");
+    // The pinned Debian build/runtime images provide the ABI-stable xxHash shared library.
+    println!("cargo:rustc-link-arg=-Wl,-l:libxxhash.so.0");
     println!("cargo:rerun-if-changed=src/fast_num.c");
 }

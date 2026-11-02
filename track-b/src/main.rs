@@ -9,6 +9,7 @@ use rustc_hash::FxHashSet;
 extern "C" {
     fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
     fn speed_demon_num(bytes: *const u8, len: usize) -> u32;
+    fn speed_demon_xxh3_lower(bytes: *const u8, len: usize) -> u64;
 }
 
 const PR_SET_THP_DISABLE: i32 = 41;
@@ -125,27 +126,21 @@ fn alnum(x: u64) -> u64 {
 /// is its lowercase), which stands in for the token. A token of up to 7 bytes is one chunk, so its
 /// hash is unique.
 fn token(b: &[u8], mut i: usize) -> (usize, u64) {
-    let mut h = 0u64;
+    let start = i;
     loop {
         let x = load(b, i);
         let n = (!alnum(x) & HIGH).trailing_zeros() as usize / 8;
-        let chunk = (x | 0x20 * ONES) & ((1u128 << (8 * n)) - 1) as u64;
-        h = (h ^ chunk).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29);
         i += n;
         if n < 8 {
-            return (i, h);
+            let hash = unsafe { speed_demon_xxh3_lower(b[start..i].as_ptr(), i - start) };
+            return (i, hash);
         }
     }
 }
 
-/// The hash token() gives the len-byte token at b[i]: one chunk per 8 bytes and a last chunk of the
-/// rest, which is empty when len is a multiple of 8.
+/// The XXH3 hash of the lowercased len-byte token at b[i].
 fn hash(b: &[u8], i: usize, len: usize) -> u64 {
-    (0..=len / 8).fold(0, |h, c| {
-        let n = (len - 8 * c).min(8);
-        let chunk = (load(b, i + 8 * c) | 0x20 * ONES) & ((1u128 << (8 * n)) - 1) as u64;
-        (h ^ chunk).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29)
-    })
+    unsafe { speed_demon_xxh3_lower(b[i..i + len].as_ptr(), len) }
 }
 
 /// Bitmasks of the ASCII letters and digits, and of the LFs, among the 64 bytes of b from i (zeros
