@@ -8,10 +8,7 @@ use std::thread;
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
-    fn mallopt(param: i32, value: i32) -> i32;
 }
-
-const M_MMAP_THRESHOLD: i32 = -3;
 
 // The line scanner, in C++ (native/scan.cpp), built into native/libscan.a by the Dockerfile.
 #[link(name = "scan", kind = "static")]
@@ -161,9 +158,6 @@ fn free_hour(parts: &[Part], h: usize) {
 }
 
 fn main() {
-    // A block of 64 KB or more is its own mapping, given back when freed. Otherwise the allocator keeps
-    // each thread's freed hour buffers, which would add up to a third of the peak.
-    unsafe { mallopt(M_MMAP_THRESHOLD, 64 << 10) };
     let b = map("/data/requests.log");
     let keys: Vec<AtomicU64> = (0..SLOTS).map(|_| AtomicU64::new(0)).collect();
     let spans: Vec<AtomicU64> = (0..SLOTS).map(|_| AtomicU64::new(0)).collect();
@@ -270,8 +264,7 @@ fn main() {
                     });
                     free_hour(parts, h);
                     let text = hour_text(base + h as u64);
-                    // An hour's lines are about 140 KB; sizing the buffer once spares its regrowth.
-                    let mut out = Vec::with_capacity(1 << 18);
+                    let mut out = Vec::new();
                     for &(name, s) in eps {
                         let n = count[s] as usize;
                         if n == 0 {
