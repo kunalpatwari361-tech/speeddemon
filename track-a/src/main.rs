@@ -3,6 +3,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::ptr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::{Barrier, OnceLock};
 use std::thread;
 
 extern "C" {
@@ -100,8 +101,8 @@ fn hour_text(hour: u64) -> String {
 }
 
 /// Calls f(record, overflow list) for every record of hour h, part by part.
-fn records(parts: &[Part], h: usize, mut f: impl FnMut(u32, &[u32])) {
-    for (streams, overflow) in parts {
+fn records(parts: &[OnceLock<Part>], h: usize, mut f: impl FnMut(u32, &[u32])) {
+    for (streams, overflow) in parts.iter().filter_map(OnceLock::get) {
         let mut c = streams[h].head;
         while !c.is_null() {
             let ch = unsafe { &*c };
@@ -141,8 +142,8 @@ fn push_num(out: &mut Vec<u8>, mut v: usize) {
 }
 
 /// Gives one hour's chunk pages in every part back to the system, a run of adjacent pages at a time.
-fn free_hour(parts: &[Part], h: usize) {
-    for (streams, _) in parts {
+fn free_hour(parts: &[OnceLock<Part>], h: usize) {
+    for (streams, _) in parts.iter().filter_map(OnceLock::get) {
         let (mut c, mut run) = (streams[h].head, (ptr::null_mut::<Chunk>(), 0));
         while !c.is_null() {
             let next = unsafe { (*c).next };
@@ -180,60 +181,55 @@ fn main() {
     // sized for its most lines (a line is at least 40 bytes) plus a partly filled chunk per hour. The arena
     // refuses huge pages: one 2 MB page would hold many hours' chunks, and giving back 4 KB of it would
     // only split it later, so a finished hour would stay counted.
-    let parts: Vec<Part> = thread::scope(|s| {
-        let hs: Vec<_> = cut
-            .windows(2)
-            .map(|w| {
-                let (keys, spans) = (&keys, &spans);
-                s.spawn(move || {
-                    let mut streams = [Stream {
-                        head: ptr::null_mut(),
-                        tail: ptr::null_mut(),
-                    }; HOURS];
-                    let pages = (w[1] - w[0]) / 40 / CHUNK + HOURS + 1;
-                    let arena = unsafe { mmap(ptr::null_mut(), pages * PAGE, 3, 0x22, -1, 0) };
-                    unsafe { madvise(arena, pages * PAGE, MADV_NOHUGEPAGE) };
-                    let mut overflow = Vec::with_capacity((w[1] - w[0]) / 40);
-                    let spilled = unsafe {
-                        scan_part(
-                            b.as_ptr(),
-                            w[0],
-                            w[1],
-                            base,
-                            keys.as_ptr() as *mut u64,
-                            spans.as_ptr() as *mut u64,
-                            streams.as_mut_ptr(),
-                            arena.cast(),
-                            overflow.as_mut_ptr(),
-                        )
-                    };
-                    unsafe { overflow.set_len(spilled as usize) };
-                    (streams, overflow)
-                })
-            })
-            .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-
-    // Endpoints in byte order.
-    let mut eps: Vec<(&[u8], usize)> = (0..SLOTS)
-        .filter(|&s| keys[s].load(Relaxed) != 0)
-        .map(|s| {
-            let v = spans[s].load(Relaxed);
-            (&b[(v >> 8) as usize..][..(v & 0xff) as usize], s)
-        })
-        .collect();
-    eps.sort_unstable();
-
-    // Hours go to whichever thread is free, and are written in hour order as they finish. An hour's
-    // latencies are gathered by endpoint into one buffer, which stays in cache.
+    // The same k threads then take the hours, once every part is scanned (no line's hour is known before),
+    // and one of them has put the endpoints in byte order. Hours go to whichever thread is free, and are
+    // written in hour order as they finish. An hour's latencies are gathered by endpoint into one buffer,
+    // which stays in cache.
+    let parts: Vec<OnceLock<Part>> = (0..k).map(|_| OnceLock::new()).collect();
+    let eps: OnceLock<Vec<(&[u8], usize)>> = OnceLock::new();
+    let (scanned, next_hour) = (Barrier::new(k), AtomicUsize::new(0));
     let mut file = File::create("/out/summary.txt").unwrap();
-    let next_hour = AtomicUsize::new(0);
     thread::scope(|s| {
         let (tx, rx) = std::sync::mpsc::channel();
-        for _ in 0..k {
-            let (tx, eps, parts, next_hour) = (tx.clone(), &eps, &parts, &next_hour);
+        for (j, w) in cut.windows(2).enumerate() {
+            let (keys, spans, parts, eps, scanned, next_hour, tx) = (&keys, &spans, &parts, &eps, &scanned, &next_hour, tx.clone());
             s.spawn(move || {
+                let mut streams = [Stream {
+                    head: ptr::null_mut(),
+                    tail: ptr::null_mut(),
+                }; HOURS];
+                let pages = (w[1] - w[0]) / 40 / CHUNK + HOURS + 1;
+                let arena = unsafe { mmap(ptr::null_mut(), pages * PAGE, 3, 0x22, -1, 0) };
+                unsafe { madvise(arena, pages * PAGE, MADV_NOHUGEPAGE) };
+                let mut overflow = Vec::with_capacity((w[1] - w[0]) / 40);
+                let spilled = unsafe {
+                    scan_part(
+                        b.as_ptr(),
+                        w[0],
+                        w[1],
+                        base,
+                        keys.as_ptr() as *mut u64,
+                        spans.as_ptr() as *mut u64,
+                        streams.as_mut_ptr(),
+                        arena.cast(),
+                        overflow.as_mut_ptr(),
+                    )
+                };
+                unsafe { overflow.set_len(spilled as usize) };
+                let _ = parts[j].set((streams, overflow));
+                if scanned.wait().is_leader() {
+                    let mut sorted: Vec<(&[u8], usize)> = (0..SLOTS)
+                        .filter(|&s| keys[s].load(Relaxed) != 0)
+                        .map(|s| {
+                            let v = spans[s].load(Relaxed);
+                            (&b[(v >> 8) as usize..][..(v & 0xff) as usize], s)
+                        })
+                        .collect();
+                    sorted.sort_unstable();
+                    let _ = eps.set(sorted);
+                }
+                scanned.wait();
+                let eps = eps.get().unwrap();
                 let (mut count, mut errors, mut at, mut lat) = (
                     vec![0u32; SLOTS],
                     vec![0u32; SLOTS],
