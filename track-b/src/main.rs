@@ -327,11 +327,20 @@ fn step(op: u8, id: u32) -> u32 {
 /// again. An empty list with no OR still to come is the answer, and the other steps are not read.
 fn eval<'a>(steps: &[u32], set: impl Fn(u32) -> Set<'a>, r: &mut [u64], v: &mut Vec<u32>) {
     let mut dense = false;
-    for (i, &s) in steps.iter().enumerate() {
-        let (op, id) = (OPS[(s >> 29 & 3) as usize], s & !(3 << 29));
-        if i > 0 && !dense && v.is_empty() && steps[i..].iter().all(|&s| OPS[(s >> 29 & 3) as usize] != b'O') {
-            break;
+    let mut i = 0;
+    while i < steps.len() {
+        // An empty sorted result stays empty through AND and NOT. Jump directly to the next
+        // OR, or stop if there is none, rather than rescanning the same suffix at every step.
+        if i > 0 && !dense && v.is_empty() {
+            if let Some(skip) = steps[i..].iter().position(|&s| OPS[(s >> 29 & 3) as usize] == b'O') {
+                i += skip;
+            } else {
+                break;
+            }
         }
+        let s = steps[i];
+        i += 1;
+        let (op, id) = (OPS[(s >> 29 & 3) as usize], s & !(3 << 29));
         match (op, set(id), dense) {
             (b'=', Set::Ids(a), _) => (v.clear(), v.extend(a.iter().map(|&d| d as u32)), dense = false).0,
             (b'=', Set::Bits(b), _) => (r.copy_from_slice(b), dense = true).0,
