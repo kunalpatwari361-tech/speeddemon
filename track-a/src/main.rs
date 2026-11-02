@@ -4,6 +4,7 @@ use std::os::fd::AsRawFd;
 use std::ptr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::thread;
+use std::sync::{Condvar, Mutex};
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -228,11 +229,15 @@ fn main() {
     // Hours go to whichever thread is free, and are written in hour order as they finish. An hour's
     // latencies are gathered by endpoint into one buffer, which stays in cache.
     let mut file = File::create("/out/summary.txt").unwrap();
-    let next_hour = AtomicUsize::new(0);
+    // Keep only a bounded window of hours in flight. Otherwise, if an early hour is
+    // slow, workers can finish later hours and retain their output buffers in `pending`.
+    let window = k.saturating_mul(2).max(1);
+    let progress = Mutex::new((0usize, 0usize)); // (next hour to assign, first hour not yet written)
+    let advanced = Condvar::new();
     thread::scope(|s| {
         let (tx, rx) = std::sync::mpsc::channel();
         for _ in 0..k {
-            let (tx, eps, parts, next_hour) = (tx.clone(), &eps, &parts, &next_hour);
+            let (tx, eps, parts) = (tx.clone(), &eps, &parts);
             s.spawn(move || {
                 let (mut count, mut errors, mut at, mut lat) = (
                     vec![0u32; SLOTS],
@@ -241,10 +246,16 @@ fn main() {
                     Vec::new(),
                 );
                 loop {
-                    let h = next_hour.fetch_add(1, Relaxed);
-                    if h >= HOURS {
-                        break;
-                    }
+                    let h = {
+                        let mut state = progress.lock().unwrap();
+                        while state.0 < HOURS && state.0 >= state.1 + window {
+                            state = advanced.wait(state).unwrap();
+                        }
+                        if state.0 >= HOURS { break; }
+                        let h = state.0;
+                        state.0 += 1;
+                        h
+                    };
                     count.fill(0);
                     errors.fill(0);
                     records(parts, h, |r, _| {
@@ -301,6 +312,9 @@ fn main() {
             while let Some(out) = pending.get_mut(written).and_then(Option::take) {
                 file.write_all(&out).unwrap();
                 written += 1;
+                let mut state = progress.lock().unwrap();
+                state.1 = written;
+                advanced.notify_all();
             }
         }
     });
