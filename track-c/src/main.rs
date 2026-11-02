@@ -201,29 +201,7 @@ fn main() {
                     // the quotes counted up to a field's end give its quote count.
                     let (mut at, mut inside, mut quotes) = (w[0], 0u64, 0u32);
                     let (mut start, mut field_quotes, mut field) = (w[0] + 3 * (b[w[0]] == 0xEF) as usize, 0, 0);
-                    let (mut id, mut name, mut note_len, mut region) = (0, (0, 0, 0), 0, 0);
-                    // A record waits AHEAD records after its group entry is prefetched, then is
-                    // counted and its name joins the name ring.
-                    let (mut recs, mut r) = ([(0u64, 0usize, (0usize, 0usize, 0u64), 0u64, 0i64); AHEAD], 0usize);
-                    let mut take = |(id, region, name, note_len, cents): (u64, usize, (usize, usize, u64), u64, i64)| {
-                        let g = group.get(region).map_or(0, |v| v.load(Relaxed)) as usize;
-                        let a = &mut agg[g];
-                        a.count += 1;
-                        a.ids += id;
-                        a.sum += cents;
-                        a.min = a.min.min(cents);
-                        a.max = a.max.max(cents);
-                        a.name_bytes += name.2;
-                        a.note_bytes += note_len;
-                        let hash = hash_of(name.0, name.1);
-                        fetch(&slots[home(hash)]);
-                        fetch(&seen[(g << SLOT_BITS | home(hash)) / 64]);
-                        if n >= AHEAD {
-                            let (h, g) = ring[n % AHEAD];
-                            mark(h, g);
-                        }
-                        (ring[n % AHEAD], n) = ((hash, g), n + 1);
-                    };
+                    let (mut id, mut name, mut note_len, mut g) = (0, (0, 0, 0), 0, 0);
                     while at < w[1] {
                         let (q, sep) = masks(b, at);
                         let inq = prefix_xor(q) ^ inside;
@@ -241,20 +219,29 @@ fn main() {
                                 0 => id = digits(b, start, len),
                                 1 => name = text(b, start, len, before - field_quotes),
                                 2 => note_len = text(b, start, len, before - field_quotes).2,
-                                3 => region = digits(b, start, len) as usize,
+                                3 => g = group.get(digits(b, start, len) as usize).map_or(0, |v| v.load(Relaxed)) as usize,
                                 _ => {
                                     // The amount, [-]digits.dd, then the CR of a CRLF.
                                     let neg = b[start] == b'-';
                                     let (s, e) = (start + neg as usize, p - (b[p - 1] == b'\r') as usize);
                                     let cents = (digits(b, s, e - 3 - s) * 100 + digits(b, e - 2, 2)) as i64;
                                     let cents = if neg { -cents } else { cents };
-                                    if let Some(v) = group.get(region) {
-                                        unsafe { std::arch::x86_64::_mm_prefetch(v as *const _ as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+                                    let a = &mut agg[g];
+                                    a.count += 1;
+                                    a.ids += id;
+                                    a.sum += cents;
+                                    a.min = a.min.min(cents);
+                                    a.max = a.max.max(cents);
+                                    a.name_bytes += name.2;
+                                    a.note_bytes += note_len;
+                                    let hash = hash_of(name.0, name.1);
+                                    fetch(&slots[home(hash)]);
+                                    fetch(&seen[(g << SLOT_BITS | home(hash)) / 64]);
+                                    if n >= AHEAD {
+                                        let (h, g) = ring[n % AHEAD];
+                                        mark(h, g);
                                     }
-                                    if r >= AHEAD {
-                                        take(recs[r % AHEAD]);
-                                    }
-                                    (recs[r % AHEAD], r) = ((id, region, name, note_len, cents), r + 1);
+                                    (ring[n % AHEAD], n) = ((hash, g), n + 1);
                                 }
                             }
                             (start, field_quotes, field) = (p + 1, before, (field + 1) % 5);
@@ -264,9 +251,6 @@ fn main() {
                         }
                         quotes += q.count_ones();
                         at += 64;
-                    }
-                    for j in r.saturating_sub(AHEAD)..r {
-                        take(recs[j % AHEAD]);
                     }
                     for j in n.saturating_sub(AHEAD)..n {
                         let (h, g) = ring[j % AHEAD];
