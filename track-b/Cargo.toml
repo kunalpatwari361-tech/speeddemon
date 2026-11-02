@@ -7,7 +7,3 @@ edition = "2021"
 lto = true
 codegen-units = 1
 panic = "abort"
-
-[dependencies]
-memchr = "=2.7.4"
-memmap2 = "=0.9.5"

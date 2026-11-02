@@ -1,14 +1,17 @@
 use std::fs::File;
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::thread;
 
 extern "C" {
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
 }
 
 const PR_SET_THP_DISABLE: i32 = 41;
 
+/// The whole file, read-only. /data is already in the page cache, so this costs no memory.
 /// n zeroed values (all-zero bytes are valid for these atomics), whose pages the kernel supplies
 /// only when first touched.
 fn zeroed<T>(n: usize) -> Vec<T> {
@@ -16,14 +19,13 @@ fn zeroed<T>(n: usize) -> Vec<T> {
     unsafe { Vec::from_raw_parts(std::alloc::alloc_zeroed(layout) as *mut T, n, n.max(1)) }
 }
 
-/// The whole file, read-only, mapped with memmap2. /data is already in the page cache, so this
-/// costs no memory.
 fn map(path: &str) -> &'static [u8] {
     let f = File::open(path).unwrap();
-    if f.metadata().unwrap().len() == 0 {
+    let len = f.metadata().unwrap().len() as usize;
+    if len == 0 {
         return &[];
     }
-    &Box::leak(Box::new(unsafe { memmap2::Mmap::map(&f).unwrap() }))[..]
+    unsafe { std::slice::from_raw_parts(mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0), len) }
 }
 
 /// Open addressing from a non-zero 64-bit key to a dense id, in insertion order, and the id's bitset
@@ -182,7 +184,7 @@ fn tokens(text: &[u8]) -> impl Iterator<Item = &[u8]> {
 /// k + 1 cut points splitting b into k parts, each starting at a document whose id is a
 /// multiple of 64, so no two parts ever touch the same bitset word.
 fn cuts(b: &[u8], k: usize) -> Vec<usize> {
-    let next = |p: usize| p + memchr::memchr(b'\n', &b[p..]).map_or(b.len() - p, |x| x + 1);
+    let next = |p: usize| p + b[p..].iter().position(|&c| c == b'\n').map_or(b.len() - p, |x| x + 1);
     let mut v: Vec<usize> = (0..k).map(|j| (b.len() * j / k).saturating_sub(1)).collect();
     for p in v.iter_mut() {
         *p = if *p == 0 { 0 } else { next(*p) };
@@ -226,7 +228,7 @@ impl Index<'_> {
         let (mut seen, mut ids) = (vec![0u32; 4096], Vec::new());
         let mut i = from;
         while i < to {
-            let tab = i + memchr::memchr(b'\t', &b[i..]).unwrap();
+            let tab = i + b[i..].iter().position(|&c| c == b'\t').unwrap();
             let doc = num(&b[i..]) as u32;
             ids.clear();
             let mut hit = |(id, dense): (u32, u32)| {
@@ -578,7 +580,7 @@ fn main() {
                             v.retain(|&d| {
                                 let d = d0 + d as usize;
                                 let line = if d == 0 { 0 } else { end[d - 1].load(Relaxed) as usize + 1 };
-                                let tab = line + memchr::memchr(b'\t', &docs[line..]).unwrap();
+                                let tab = line + docs[line..].iter().position(|&c| c == b'\t').unwrap();
                                 toks.clear();
                                 toks.extend(tokens(&docs[tab + 1..end[d].load(Relaxed) as usize]));
                                 toks.windows(phrase.len()).any(|w| w.iter().zip(&phrase).all(|(a, b)| a.eq_ignore_ascii_case(b)))
