@@ -4,7 +4,7 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-Rust, with two crates: `memmap2` maps both files, and `/data` is already in the page cache, so reading costs no copy and no memory; `memchr` finds single bytes, such as the tab after a document's id and the end of a line.
+Rust, with four focused crates: `memmap2` maps both files, and `/data` is already in the page cache, so reading costs no copy and no memory; `memchr` finds single bytes, such as the tab after a document's id and the end of a line. `rayon` schedules the independent scan/sample work over the hardware threads, while `rustc-hash` supplies a fast per-document duplicate filter for rare postings.
 
 Only what the queries ask about is indexed. The queries are parsed first. Every distinct term gets an id, and so does every adjacent pair of terms in a phrase. A document's tokens are found 64 bytes at a time: AVX2 compares give a bitmask of its letters and digits and one of its LF, and a token starts at a set bit after a clear one and ends at the next clear bit. Each token's lowercased bytes are mixed into a 64-bit hash 8 bytes at a time, so a token of up to 7 bytes has a hash no other token has. A token's filter word and table slot are prefetched as soon as it is found, and it is looked up 16 tokens later, in order, so several lookups' cache misses overlap. The hash is looked up in an open-addressing table, sized from the queries, behind a 128 KB filter, two bits of one 64-bit word per key, that answers most misses without touching the table. Most adjacent pairs of query terms are not phrase pairs, so the pair table's filter does most of the work there.
 
@@ -21,7 +21,7 @@ The binary is built for the scoring CPU (`target-cpu=native`) with profile-guide
 
 ## Dependencies
 
-`memchr` 2.7.4 and `memmap2` 0.9.5, vendored in `vendor/` with `libc` 0.2.169, which `memmap2` uses, so the build stays offline.
+`memchr` 2.7.4, `memmap2` 0.9.5, `rayon` 1.10.0, and `rustc-hash` 2.1.1 are vendored in `vendor/` with their transitive crates, so the build stays offline.
 
 ## With another 24 hours
 

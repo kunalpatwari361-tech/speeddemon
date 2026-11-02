@@ -3,6 +3,9 @@ use std::io::Write;
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::thread;
 
+use rayon::prelude::*;
+use rustc_hash::FxHashSet;
+
 extern "C" {
     fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
 }
@@ -200,12 +203,8 @@ fn num(b: &[u8]) -> usize {
 }
 
 /// Runs f(j) for every j in 0..k, each on its own thread, and returns the results in order.
-fn each<T: Send>(k: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
-    thread::scope(|s| {
-        let f = &f;
-        let hs: Vec<_> = (0..k).map(|j| s.spawn(move || f(j))).collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    })
+fn each<T: Send>(k: usize, f: impl Fn(usize) -> T + Sync + Send) -> Vec<T> {
+    (0..k).into_par_iter().map(f).collect()
 }
 
 struct Index<'a> {
@@ -221,9 +220,9 @@ impl Index<'_> {
     /// where each document's line ends.
     fn scan(&self, from: usize, to: usize, end: &[AtomicU32], mut f: impl FnMut(u32, u32, u32)) {
         let (b, nt) = (self.docs, self.terms.len);
-        // seen[id % 4096] is doc + 1 once an id with those low bits is reported for the document;
-        // the document's reported ids settle whether it was this one.
-        let (mut seen, mut ids) = (vec![0u32; 4096], Vec::new());
+        // FxHashSet keeps the per-document duplicate filter compact and makes duplicate checks
+        // constant-time even when a document contains many repeated query terms.
+        let mut ids = FxHashSet::default();
         let mut i = from;
         while i < to {
             let tab = i + memchr::memchr(b'\t', &b[i..]).unwrap();
@@ -232,8 +231,7 @@ impl Index<'_> {
             let mut hit = |(id, dense): (u32, u32)| {
                 if dense != u32::MAX {
                     f(doc, id, dense);
-                } else if seen[id as usize % 4096] != doc + 1 || !ids.contains(&id) {
-                    (seen[id as usize % 4096], _) = (doc + 1, ids.push(id));
+                } else if ids.insert(id) {
                     f(doc, id, dense);
                 }
             };
