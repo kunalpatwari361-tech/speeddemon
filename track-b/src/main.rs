@@ -543,7 +543,7 @@ fn main() {
                             v.retain(|&d| {
                                 let d = d0 + d as usize;
                                 let line = if d == 0 { 0 } else { end[d - 1].load(Relaxed) as usize + 1 };
-                                let tab = line + docs[line..].iter().position(|&c| c == b'\\t').unwrap();
+                                let tab = line + docs[line..].iter().position(|&c| c == b'\t').unwrap();
                                 opt::phrase_matches(&docs[tab + 1..end[d].load(Relaxed) as usize], phrase)
                             });
                         }
