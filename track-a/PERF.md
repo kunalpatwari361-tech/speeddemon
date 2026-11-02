@@ -67,3 +67,6 @@ Hour phase, later: phase timers put the scan at 20 to 28 ms and the hours at abo
 Tried, not kept: each output line written into space reserved once, its numbers two digits at a time from a table of the pairs 00 to 99. Same output; 14 paired full runs on the 8 efficiency cores: wall 36 to 36 ms (faster in 8/14), CPU 210 to 201 ms (less in 10/14); on all cores: wall 35 to 36 ms (6/14), CPU 228 to 224 ms (9/14). With the line buffer already sized once, the formatting is no longer what the hours wait on.
 
 Frozen: the Track A source is back to the version of 9013f4d, measured on the board as run-f904aa268b33 (0.0309 s, 20.7 MB, 79.28 points). Two later changes, `mallopt(M_MMAP_THRESHOLD, 64 KB)` and the hour line buffer sized once, were measured only on the laptop and had no board run before the freeze, so they were taken out. Their laptop measurements above stay as a record of what was tried.
+
+
+Memory experiment (not yet benchmarked): cap the number of assigned-but-not-written hours at twice the worker count. This prevents a slow early hour from allowing the other workers to accumulate output buffers for most of the 72-hour window in `pending`. The result order is unchanged; workers wait for the writer to advance the window. Runtime, peak memory, and all-four-dataset output hashes still need validation before this is accepted as a performance improvement.
