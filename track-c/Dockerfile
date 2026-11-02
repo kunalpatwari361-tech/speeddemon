@@ -6,6 +6,8 @@ RUN python3 generator.py --seed 2 --scale full --out /profile/data
 FROM halloumee/speed-demon-rust:1.99.1-trixie-llvm-tools@sha256:13e4ee7135d8eac6c56476c7d1aee201f36479f4745fd5d0e6b4529f4e13251a AS build
 WORKDIR /src
 COPY Cargo.toml .
+COPY Cargo.lock .
+COPY vendor vendor
 COPY .cargo .cargo
 COPY src src
 RUN mkdir -p /tmp/pgo && RUSTFLAGS="-C target-cpu=native -Cprofile-generate=/tmp/pgo" cargo build --release --offline

@@ -4,7 +4,7 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-Rust, standard library only. Both input files are memory-mapped; `/data` is already in the page cache, so reading costs no copy and no memory.
+Rust, with `memchr` for newline searches and `memmap2` for read-only file mappings. `/data` is already in the page cache, so reading costs no copy and no memory.
 
 The graph file is read three times, on every hardware thread; /data is in the page cache, so a read costs time but no input copy. The first read counts out-degrees and marks nodes with in-edges. The second places only heads for renumbering. After renumbering, the third pass writes renamed heads and weights directly into the final 64-bit adjacency.
 
@@ -15,6 +15,8 @@ Queries are sorted by renumbered source and cut into a seven-worker search pool,
 The allocator gives every block of 64 KB or more back when it is freed (`mallopt`), so the first adjacency and each search's tables do not stay with the process after they are dropped. A search lists the nodes it reaches, to zero them again, but only up to a sixteenth of the table; past that it clears the whole table. The queries are renamed before the searches, so the old-to-new numbering is freed first.
 
 ## Dependencies
+
+`memchr` 2.7.4 and `memmap2` 0.9.5 are vendored and pinned for the offline build.
 
 None.
 

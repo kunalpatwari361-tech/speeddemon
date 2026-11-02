@@ -1,11 +1,11 @@
 use std::fs::File;
 use std::io::Write;
-use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::thread;
+use memchr::{memchr, memrchr};
+use memmap2::MmapOptions;
 
 extern "C" {
-    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
 }
 
@@ -24,7 +24,7 @@ fn map(path: &str) -> &'static [u8] {
     if len == 0 {
         return &[];
     }
-    unsafe { std::slice::from_raw_parts(mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0), len) }
+    &Box::leak(Box::new(unsafe { MmapOptions::new().map(&f).unwrap() }))[..]
 }
 
 /// Bitmasks of the quotes, and of the commas and LFs, among the 64 bytes of b from i (zeros past
@@ -120,8 +120,8 @@ fn main() {
     // regions.csv in k parts of whole lines "region_id,CCC". A country code [A-Z]{3} is its own
     // index into 26^3 slots, already in byte order.
     let regions = map("/data/regions.csv");
-    let body = regions.iter().position(|&c| c == b'\n').unwrap() + 1;
-    let line_at = |p: usize| p + regions[p - 1..].iter().position(|&c| c == b'\n').unwrap();
+    let body = memchr(b'\n', regions).unwrap() + 1;
+    let line_at = |p: usize| p + memchr(b'\n', &regions[p - 1..]).unwrap();
     let rcut: Vec<usize> = (0..=k).map(|j| line_at(body + (regions.len() - body) * j / k)).collect();
     let lines = |j: usize| regions[rcut[j]..rcut[j + 1]].split(|&c| c == b'\n').filter(|l| !l.is_empty());
     let code = |l: &[u8]| l[l.len() - 3..].iter().fold(0, |v, &c| v * 26 + (c - b'A') as usize);
@@ -138,7 +138,7 @@ fn main() {
     let mut rank = vec![0u8; used.len()];
     codes.iter().enumerate().for_each(|(r, &c)| rank[c] = r as u8 + 1);
     let groups = codes.len() + 1;
-    let last = regions[..regions.len() - 1].iter().rposition(|&c| c == b'\n').unwrap() + 1;
+    let last = memrchr(b'\n', &regions[..regions.len() - 1]).unwrap() + 1;
     let group: Vec<AtomicU8> = zeroed(digits(regions, last, regions.len() - 5 - last) as usize + 1);
     thread::scope(|s| {
         for j in 0..k {
@@ -174,7 +174,7 @@ fn main() {
         }
     };
 
-    let body = b.iter().position(|&c| c == b'\n').map_or(b.len(), |p| p + 1);
+    let body = memchr(b'\n', b).map_or(b.len(), |p| p + 1);
     let mut cut: Vec<usize> = (0..k).map(|j| record_start(b, body + (b.len() - body) * j / k).max(body)).collect();
     cut[0] = body;
     cut.push(b.len());

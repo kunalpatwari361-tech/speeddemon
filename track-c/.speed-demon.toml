@@ -2,4 +2,4 @@
 track = "c"
 team = "Dracarys"
 language = "Rust"
-dependency_count = 0
+dependency_count = 2

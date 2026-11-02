@@ -4,7 +4,7 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-Rust, standard library only. Both files are memory-mapped; `/data` is already in the page cache, so reading costs no copy and no memory.
+Rust, with `memchr` for single-byte delimiters and `memmap2` for read-only file mappings. `/data` is already in the page cache, so reading costs no copy and no memory.
 
 `regions.csv` is read on every hardware thread, in two passes over its lines: the first marks the country codes in use, the second writes one byte per region id, 1 + its country's rank, with 0 for an unknown region. A country code `[A-Z]{3}` is used directly as an index into 26³ slots, so the countries come out in byte order without sorting.
 
@@ -17,6 +17,8 @@ The process asks for no transparent huge pages.
 The binary is built for the scoring CPU (`target-cpu=native`) with profile-guided optimisation: during the offline build, a byte-identical copy of the published generator (`generator.py`, seed 2) makes a full-size training dataset, the instrumented binary runs on it, and `llvm-profdata` guides the final build. The runtime image holds only the Rust executable.
 
 ## Dependencies
+
+`memchr` 2.7.4 and `memmap2` 0.9.5 are vendored and pinned for the offline build.
 
 None.
 

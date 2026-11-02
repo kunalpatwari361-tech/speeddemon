@@ -1,11 +1,11 @@
 use std::fs::File;
 use std::io::Write;
-use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::thread;
+use memchr::memchr;
+use memmap2::MmapOptions;
 
 extern "C" {
-    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn mallopt(param: i32, value: i32) -> i32;
 }
 
@@ -16,7 +16,7 @@ fn map(path: &str) -> &'static [u8] {
     if len == 0 {
         return &[];
     }
-    unsafe { std::slice::from_raw_parts(mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0), len) }
+    &Box::leak(Box::new(unsafe { MmapOptions::new().map(&f).unwrap() }))[..]
 }
 
 /// n zeroed atomic integers (all-zero bytes are a valid value), whose pages the kernel supplies
@@ -41,7 +41,7 @@ fn num(b: &[u8], i: &mut usize) -> u64 {
 fn cuts(b: &[u8], from: usize, k: usize) -> Vec<usize> {
     let mut v: Vec<usize> = (0..k)
         .map(|j| from + (b.len() - from) * j / k)
-        .map(|p| if p == from { p } else { p + b[p..].iter().position(|&c| c == b'\n').map_or(b.len() - p, |x| x + 1) })
+        .map(|p| if p == from { p } else { p + memchr(b'\n', &b[p..]).map_or(b.len() - p, |x| x + 1) })
         .collect();
     v.push(b.len());
     v
