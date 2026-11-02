@@ -155,8 +155,17 @@ fn main() {
     // A slot holds a name's 64-bit hash, which identifies it among the 100,000 (a collision is
     // about 1 in 4 billion).
     let hash_of = |at: usize, len: usize| {
-        let chunk = |k: usize| load(b, at + k) & ((1u128 << (8 * (len - k).min(8))) - 1) as u64;
-        (0..len).step_by(8).fold(len as u64, |h, k| (h ^ chunk(k)).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29)) | 1
+        let mut h = len as u64;
+        let mut k = 0;
+        while k < len {
+            let n = (len - k).min(8);
+            let mask = if n == 8 { u64::MAX } else { (1u64 << (n * 8)) - 1 };
+            h = (h ^ (load(b, at + k) & mask))
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                .rotate_left(29);
+            k += 8;
+        }
+        h | 1
     };
     let home = |hash: u64| (hash.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - SLOT_BITS)) as usize;
     let slot_of = |hash: u64| {
