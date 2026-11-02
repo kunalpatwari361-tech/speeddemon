@@ -88,3 +88,6 @@ Tried after the parallel `regions.csv` (f70c04e), not kept. With the 4 performan
 | The name table, the bitsets and the group bytes on 2 MB pages (MADV_HUGEPAGE, in place of turning huge pages off), so their random lookups miss the TLB less | peak 8 to 12 MiB on 4 threads, 9 to 13 MiB on all; faster in 8/12 and 5/12 |
 
 Prefetching the group entry: a record's group-table entry is prefetched when it is parsed, and the record is counted 16 records later (its name then joins the name ring); the order is kept. All four datasets matched; peak unchanged (about 9 MB). Laptop, paired full runs, two sets of 14 per setup: on 6 performance threads wall 117 to 117 ms (faster in 6/14), then 90 to 84 ms (10/14), CPU 551 to 564 (6/14), then 429 to 381 (11/14); on all cores wall 128 to 104 ms (9/14), then 71 to 71 (5/14); on the efficiency cores 68 to 68 ms (8/14). A small gain at most, inside the laptop's spread.
+
+
+Hashing experiment (not yet benchmarked): replace the per-chunk `u128` shift used to mask the final 1–7 bytes of a name with a 64-bit mask and an explicit chunk loop. The hash recurrence and byte order are unchanged. This targets the name-hashing hot path; compile validation, all-four-dataset output hashes, and paired runtime measurements are still required before judging whether it helps.
