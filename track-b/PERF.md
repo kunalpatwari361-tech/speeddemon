@@ -76,3 +76,8 @@ Where a run goes now (laptop, 5 runs, phase timers): parsing the queries 34 to 5
 ## Additive change: allocation-free phrase verification (not yet benchmarked)
 
 Added `src/opt.rs` and wired it into the existing phrase-candidate verification path. The existing index, postings representation, BOOL evaluator, output format, and all other tracks are unchanged. The new verifier streams ASCII-alphanumeric tokens directly from the memory-mapped document slice and compares them case-insensitively; it does not allocate a per-candidate `Vec<&[u8]>` for document tokens or a phrase-token vector. This should reduce transient allocations and allocator work for PHRASE queries. It has not yet been benchmarked on the official datasets, and no speedup or peak-RAM reduction is claimed until the full checker confirms byte-identical output and measurements.
+
+
+## Additive change: linear-time empty-result skipping (not yet benchmarked)
+
+When a BOOL evaluation's sorted result becomes empty, the evaluator now searches once for the next OR and jumps directly to it, or stops if none remains. Previously it rechecked the remaining suffix at each AND/NOT step, which could repeatedly scan the same operators when an OR occurred later. This preserves left-to-right evaluation and avoids that repeated control-flow work. It has not yet been benchmarked on the official datasets; no speedup is claimed until the full checker confirms identical output and measurements.
