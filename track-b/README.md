@@ -25,4 +25,6 @@ None.
 
 ## With another 24 hours
 
-Delta-coded posting lists, for less memory per round, so fewer rounds would fit the same budget.
+Where a run's time goes now (laptop, phase timers): the scan of the documents about 60%, answering the queries about 18%, placing the postings about 8%, parsing the queries about 6%, the layout and the sample the rest. The scan already finds tokens with AVX2 bitmasks and prefetches each lookup 16 tokens ahead; prefetching the pair lookups and pre-faulting the round's arrays were measured and gave nothing. What is left in the other phases is worth one or two percent each, about what the lines would cost.
+
+The next real step is a different index: delta-coded posting lists, so a round's postings take less memory and fewer rounds fit the same budget. Every round answers every query again, so fewer rounds would cut the answering and the per-round layout, which six rounds already showed (4% less time) but for 14% more memory with the present layout.
